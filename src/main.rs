@@ -42,14 +42,14 @@ fn create_random_geometric_graph(
     width: f32,
     height: f32,
 ) -> (Graph, KdTree<f64, usize, [f64; 2]>) {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rngs::ThreadRng::default();
 
     // 1. Create nodes with random positions
     let mut nodes = Array2::<f32>::zeros((num_nodes, 2));
     let mut points = Vec::with_capacity(num_nodes);
     for i in 0..num_nodes {
-        let x = rng.gen_range(0.0..width);
-        let y = rng.gen_range(0.0..height);
+        let x = rng.random_range(0.0..width);
+        let y = rng.random_range(0.0..height);
         nodes[[i, 0]] = x;
         nodes[[i, 1]] = y;
         points.push([x as f64, y as f64]);
@@ -142,7 +142,6 @@ fn relax_graph_step(
             forces[[i, 1]] += force.y;
         }
 
-
         // Containment force from window boundaries
         let margin = 50.0;
         if pos_i.x < margin {
@@ -161,8 +160,6 @@ fn relax_graph_step(
 
     graph.nodes += &forces;
 }
-
-use rayon::prelude::*;
 
 /// Runs one time-step of the wave simulation.
 fn run_simulation_step(graph: &Graph, state: &mut SimState, c: f32, dt: f32, damping: f32) {
@@ -248,7 +245,7 @@ async fn main() {
             let (mx, my) = mouse_position();
             let mouse_pos_f64 = [mx as f64, my as f64];
             if let Ok(neighbors) = kdtree.nearest(&mouse_pos_f64, 1, &squared_euclidean) {
-                if let Some(&(_, &nearest_node_index)) = neighbors.get(0) {
+                if let Some(&(_, &nearest_node_index)) = neighbors.first() {
                     state.u[nearest_node_index] = 1.0;
                     println!("Plucked node {}", nearest_node_index);
                 }
