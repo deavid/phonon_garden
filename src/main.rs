@@ -83,12 +83,19 @@ fn create_random_geometric_graph(num_nodes: usize, radius: f32, width: f32, heig
 }
 
 /// Performs a single step of graph relaxation.
-fn relax_graph_step(graph: &mut Graph, repulsion_strength: f32, width: f32, height: f32) {
+fn relax_graph_step(
+    graph: &mut Graph,
+    repulsion_strength: f32,
+    spring_strength: f32,
+    ideal_distance: f32,
+    width: f32,
+    height: f32,
+) {
     let mut forces = vec![Vec2::ZERO; graph.nodes.len()];
     let containment_strength = 0.01;
 
     for i in 0..graph.nodes.len() {
-        // Repulsion from other nodes
+        // Repulsion from all other nodes
         for j in 0..graph.nodes.len() {
             if i == j {
                 continue;
@@ -100,6 +107,16 @@ fn relax_graph_step(graph: &mut Graph, repulsion_strength: f32, width: f32, heig
                 forces[i] += force * repulsion_strength;
             }
         }
+
+        // Spring force with connected neighbors
+        for &neighbor_index in &graph.adj[i] {
+            let d = graph.nodes[neighbor_index].pos - graph.nodes[i].pos;
+            let dist = d.length();
+            let displacement = dist - ideal_distance;
+            let force = d.normalize_or_zero() * displacement * spring_strength;
+            forces[i] += force;
+        }
+
 
         // Containment force from window boundaries
         let pos = graph.nodes[i].pos;
@@ -177,7 +194,14 @@ async fn main() {
         match phase {
             AppPhase::Relaxing => {
                 if relaxation_step < RELAXATION_ITERATIONS {
-                    relax_graph_step(&mut graph, REPULSION_STRENGTH, width, height);
+                    relax_graph_step(
+                        &mut graph,
+                        REPULSION_STRENGTH,
+                        0.01, // spring_strength
+                        CONNECTION_RADIUS,
+                        width,
+                        height,
+                    );
                     relaxation_step += 1;
                 } else {
                     phase = AppPhase::Simulating;
