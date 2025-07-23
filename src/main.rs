@@ -20,6 +20,7 @@ struct Graph {
 }
 
 // Holds the dynamic state of the wave simulation.
+#[allow(dead_code)]
 struct SimState {
     // Displacement ('u') for each node.
     u: Array1<f32>,
@@ -32,19 +33,19 @@ struct SimState {
 
 use kdtree::distance::squared_euclidean;
 use kdtree::KdTree;
-use rand::{thread_rng, Rng};
+use rand::Rng;
 
 /// Creates a Random Geometric Graph by connecting nodes within a given radius.
 /// Uses a k-d tree for efficient neighbor search.
 fn create_random_geometric_graph(num_nodes: usize, radius: f32, width: f32, height: f32) -> Graph {
-    let mut rng = thread_rng();
+    let mut rng = rand::rng();
 
     // 1. Create nodes with random positions
     let mut nodes = Vec::with_capacity(num_nodes);
     let mut points = Vec::with_capacity(num_nodes);
     for _ in 0..num_nodes {
-        let x = rng.gen_range(0.0..width);
-        let y = rng.gen_range(0.0..height);
+        let x = rng.random_range(0.0..width);
+        let y = rng.random_range(0.0..height);
         nodes.push(Node {
             pos: Vec2::new(x, y),
         });
@@ -94,13 +95,13 @@ fn relax_graph_step(
     let mut forces = vec![Vec2::ZERO; graph.nodes.len()];
     let containment_strength = 0.01;
 
-    for i in 0..graph.nodes.len() {
+    for (i, node) in graph.nodes.iter().enumerate() {
         // Repulsion from all other nodes
-        for j in 0..graph.nodes.len() {
+        for (j, other_node) in graph.nodes.iter().enumerate() {
             if i == j {
                 continue;
             }
-            let d = graph.nodes[i].pos - graph.nodes[j].pos;
+            let d = node.pos - other_node.pos;
             let dist_sq = d.length_squared();
             if dist_sq > 1e-6 {
                 let force = d / dist_sq;
@@ -110,27 +111,27 @@ fn relax_graph_step(
 
         // Spring force with connected neighbors
         for &neighbor_index in &graph.adj[i] {
-            let d = graph.nodes[neighbor_index].pos - graph.nodes[i].pos;
+            let d = graph.nodes[neighbor_index].pos - node.pos;
             let dist = d.length();
             let displacement = dist - ideal_distance;
             let force = d.normalize_or_zero() * displacement * spring_strength;
             forces[i] += force;
         }
 
-
         // Containment force from window boundaries
-        let pos = graph.nodes[i].pos;
+        let pos = node.pos;
         forces[i].x -= (pos.x - width * 0.5) * containment_strength;
         forces[i].y -= (pos.y - height * 0.5) * containment_strength;
     }
 
-    for i in 0..graph.nodes.len() {
-        graph.nodes[i].pos += forces[i];
+    for (i, node) in graph.nodes.iter_mut().enumerate() {
+        node.pos += forces[i];
     }
 }
 
 /// TODO: Implement the simulation logic.
 /// Runs one time-step of the wave simulation.
+#[allow(dead_code)]
 fn run_simulation_step(_graph: &Graph, _state: &mut SimState, _c: f32, _dt: f32, _damping: f32) {
     // Placeholder implementation
     // This is where the Laplacian calculation and state updates will happen.
@@ -138,6 +139,7 @@ fn run_simulation_step(_graph: &Graph, _state: &mut SimState, _c: f32, _dt: f32,
 
 /// TODO: Implement the visualization logic.
 /// Maps the simulation state (u, v) to a color for rendering.
+#[allow(dead_code)]
 fn get_color_for_node(_u: f32, _v: f32) -> Color {
     // Placeholder: just a simple grey for now.
     // The final version will have the complex u,v -> color mapping.
@@ -167,7 +169,9 @@ async fn main() {
     // --- Configuration ---
     const NUM_NODES: usize = 10_000; // Start with a smaller number for faster prototyping
     const CONNECTION_RADIUS: f32 = 15.0;
+    #[allow(dead_code)]
     const WAVE_SPEED: f32 = 1.0;
+    #[allow(dead_code)]
     const DAMPING: f32 = 0.005;
     const RELAXATION_ITERATIONS: usize = 100;
     const REPULSION_STRENGTH: f32 = 0.1;
