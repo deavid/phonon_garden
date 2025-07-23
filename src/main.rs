@@ -104,7 +104,33 @@ fn relax_graph_step(
     height: f32,
 ) {
     let mut forces = Array2::<f32>::zeros((graph.nodes.nrows(), 2));
-    let containment_strength = 0.01;
+    let containment_strength = 0.001;
+
+    // Calculate current average edge length for uniform target
+    let mut total_edge_length = 0.0;
+    let mut edge_count = 0;
+
+    for i in 0..graph.nodes.nrows() {
+        let pos_i = Vec2::new(graph.nodes[[i, 0]], graph.nodes[[i, 1]]);
+        for &neighbor_index in &graph.adj[i] {
+            if neighbor_index > i {
+                // Only count each edge once
+                let pos_neighbor = Vec2::new(
+                    graph.nodes[[neighbor_index, 0]],
+                    graph.nodes[[neighbor_index, 1]],
+                );
+                let dist = (pos_neighbor - pos_i).length();
+                total_edge_length += dist;
+                edge_count += 1;
+            }
+        }
+    }
+
+    let target_edge_length = if edge_count > 0 {
+        total_edge_length / edge_count as f32
+    } else {
+        ideal_distance // Fallback to the provided ideal distance
+    };
 
     for i in 0..graph.nodes.nrows() {
         // Repulsion from nearby nodes
@@ -128,7 +154,7 @@ fn relax_graph_step(
             }
         }
 
-        // Spring force with connected neighbors
+        // Spring force with connected neighbors - now using uniform target length
         for &neighbor_index in &graph.adj[i] {
             let pos_neighbor = Vec2::new(
                 graph.nodes[[neighbor_index, 0]],
@@ -136,7 +162,7 @@ fn relax_graph_step(
             );
             let d = pos_neighbor - pos_i;
             let dist = d.length();
-            let displacement = dist - ideal_distance;
+            let displacement = dist - target_edge_length;
             let force = d.normalize_or_zero() * displacement * spring_strength;
             forces[[i, 0]] += force.x;
             forces[[i, 1]] += force.y;
@@ -180,6 +206,7 @@ fn run_simulation_step(graph: &Graph, state: &mut SimState, c: f32, dt: f32, dam
         state.v[i] += acceleration[i] * dt;
         state.v[i] *= 1.0 - damping; // Apply damping
         state.u[i] += state.v[i] * dt;
+        state.u[i] *= 1.0 - damping / 3.0; // Apply damping for general values
     }
 }
 
@@ -187,6 +214,9 @@ use macroquad::texture::{Image, Texture2D};
 
 /// Maps the simulation state (u, v) to a color for rendering.
 fn get_color_for_node(u: f32, v: f32) -> Color {
+    const S: f32 = 3.0;
+    let u = (u * S).cbrt() * S;
+    let v = (v * S).cbrt() * S;
     let r = (0.5 + u).clamp(0.0, 1.0);
     let g = (0.5 + v).clamp(0.0, 1.0);
     let b = (0.5 - u).clamp(0.0, 1.0);
@@ -203,8 +233,8 @@ enum AppPhase {
 fn window_conf() -> Conf {
     Conf {
         window_title: "Phonon Garden".to_string(),
-        window_width: 1000,
-        window_height: 1000,
+        window_width: 500,
+        window_height: 500,
         ..Default::default()
     }
 }
@@ -214,12 +244,12 @@ async fn main() {
     println!("Welcome to the Phonon Garden. Initializing...");
 
     // --- Configuration ---
-    const NUM_NODES: usize = 10_000; // Start with a smaller number for faster prototyping
-    const CONNECTION_RADIUS: f32 = 15.0;
+    const NUM_NODES: usize = 100_000;
+    const CONNECTION_RADIUS: f32 = 6.0;
     const WAVE_SPEED: f32 = 1.0;
     const DAMPING: f32 = 0.005;
-    const RELAXATION_ITERATIONS: usize = 100;
-    const REPULSION_STRENGTH: f32 = 0.1;
+    const RELAXATION_ITERATIONS: usize = 10;
+    const REPULSION_STRENGTH: f32 = 0.4;
     const IDEAL_SPRING_LENGTH_MULTIPLIER: f32 = 1.0;
 
     // --- Setup Phase ---
@@ -272,6 +302,7 @@ async fn main() {
             }
             AppPhase::Simulating => {
                 let dt = get_frame_time();
+                // Run wave simulation
                 run_simulation_step(&graph, &mut state, WAVE_SPEED, dt, DAMPING);
             }
         }
