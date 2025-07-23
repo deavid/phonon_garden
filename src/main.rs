@@ -1,4 +1,7 @@
-use macroquad::prelude::*;
+use macroquad::prelude::{
+    clear_background, draw_circle, draw_text, is_mouse_button_pressed, mouse_position, next_frame,
+    screen_height, screen_width, Color, Conf, MouseButton, Vec2, BLACK, GRAY, WHITE,
+};
 use ndarray::Array1;
 
 // --- Data Structures ---
@@ -27,31 +30,106 @@ struct SimState {
 // --- Core Functions ---
 // These are the placeholders for the main logic that the agent will implement.
 
-/// TODO: Implement graph generation.
+use kdtree::distance::squared_euclidean;
+use kdtree::KdTree;
+use rand::{thread_rng, Rng};
+
 /// Creates a Random Geometric Graph by connecting nodes within a given radius.
-/// Should use the kdtree crate for efficiency.
+/// Uses a k-d tree for efficient neighbor search.
 fn create_random_geometric_graph(num_nodes: usize, radius: f32, width: f32, height: f32) -> Graph {
-    // Placeholder implementation
-    println!("TODO: Implement create_random_geometric_graph");
-    Graph {
-        nodes: vec![],
-        adj: vec![],
+    let mut rng = thread_rng();
+
+    // 1. Create nodes with random positions
+    let mut nodes = Vec::with_capacity(num_nodes);
+    let mut points = Vec::with_capacity(num_nodes);
+    for _ in 0..num_nodes {
+        let x = rng.gen_range(0.0..width);
+        let y = rng.gen_range(0.0..height);
+        nodes.push(Node {
+            pos: Vec2::new(x, y),
+        });
+        points.push([x as f64, y as f64]);
+    }
+
+    // 2. Build the k-d tree for efficient spatial queries
+    let mut kdtree = KdTree::new(2);
+    for (i, point) in points.iter().enumerate() {
+        kdtree.add(*point, i).unwrap();
+    }
+
+    // 3. Find neighbors for each node
+    let mut adj = vec![vec![]; num_nodes];
+    let radius_squared = (radius as f64).powi(2);
+
+    for (i, point) in points.iter().enumerate() {
+        let neighbors = kdtree
+            .within(point, radius_squared, &squared_euclidean)
+            .unwrap();
+
+        for &(_, &neighbor_index) in neighbors.iter() {
+            if i != neighbor_index {
+                adj[i].push(neighbor_index);
+            }
+        }
+    }
+
+    println!(
+        "Graph generated: {} nodes, average degree: {:.2}",
+        num_nodes,
+        adj.iter().map(|n| n.len()).sum::<usize>() as f32 / num_nodes as f32
+    );
+
+    Graph { nodes, adj }
+}
+
+/// Performs a single step of graph relaxation.
+fn relax_graph_step(graph: &mut Graph, repulsion_strength: f32, width: f32, height: f32) {
+    let mut forces = vec![Vec2::ZERO; graph.nodes.len()];
+    let containment_strength = 0.01;
+
+    for i in 0..graph.nodes.len() {
+        // Repulsion from other nodes
+        for j in 0..graph.nodes.len() {
+            if i == j {
+                continue;
+            }
+            let d = graph.nodes[i].pos - graph.nodes[j].pos;
+            let dist_sq = d.length_squared();
+            if dist_sq > 1e-6 {
+                let force = d / dist_sq;
+                forces[i] += force * repulsion_strength;
+            }
+        }
+
+        // Containment force from window boundaries
+        let pos = graph.nodes[i].pos;
+        forces[i].x -= (pos.x - width * 0.5) * containment_strength;
+        forces[i].y -= (pos.y - height * 0.5) * containment_strength;
+    }
+
+    for i in 0..graph.nodes.len() {
+        graph.nodes[i].pos += forces[i];
     }
 }
 
 /// TODO: Implement the simulation logic.
 /// Runs one time-step of the wave simulation.
-fn run_simulation_step(graph: &Graph, state: &mut SimState, c: f32, dt: f32, damping: f32) {
+fn run_simulation_step(_graph: &Graph, _state: &mut SimState, _c: f32, _dt: f32, _damping: f32) {
     // Placeholder implementation
     // This is where the Laplacian calculation and state updates will happen.
 }
 
 /// TODO: Implement the visualization logic.
 /// Maps the simulation state (u, v) to a color for rendering.
-fn get_color_for_node(u: f32, v: f32) -> Color {
+fn get_color_for_node(_u: f32, _v: f32) -> Color {
     // Placeholder: just a simple grey for now.
     // The final version will have the complex u,v -> color mapping.
     GRAY
+}
+
+enum AppPhase {
+    Relaxing,
+    Simulating,
 }
 
 // --- Main Application Loop ---
@@ -74,12 +152,15 @@ async fn main() {
     const CONNECTION_RADIUS: f32 = 15.0;
     const WAVE_SPEED: f32 = 1.0;
     const DAMPING: f32 = 0.005;
+    const RELAXATION_ITERATIONS: usize = 100;
+    const REPULSION_STRENGTH: f32 = 0.1;
 
     // --- Setup Phase ---
-    // This is where the agent will call the generation and setup functions.
-    // let graph = create_random_geometric_graph(NUM_NODES, ...);
-    // let mut state = SimState { u: ..., v: ... };
-    println!("TODO: Call graph generation and initialize simulation state.");
+    let (width, height) = (screen_width(), screen_height());
+    let mut graph = create_random_geometric_graph(NUM_NODES, CONNECTION_RADIUS, width, height);
+
+    let mut phase = AppPhase::Relaxing;
+    let mut relaxation_step = 0;
 
     // --- Main Loop ---
     loop {
@@ -92,28 +173,41 @@ async fn main() {
             );
         }
 
-        // --- Simulation Step ---
-        let dt = get_frame_time();
-        // TODO: Call run_simulation_step(&graph, &mut state, ...);
+        // --- Phase-specific Logic ---
+        match phase {
+            AppPhase::Relaxing => {
+                if relaxation_step < RELAXATION_ITERATIONS {
+                    relax_graph_step(&mut graph, REPULSION_STRENGTH, width, height);
+                    relaxation_step += 1;
+                } else {
+                    phase = AppPhase::Simulating;
+                }
+            }
+            AppPhase::Simulating => {
+                // let dt = get_frame_time();
+                // run_simulation_step(&graph, &mut state, WAVE_SPEED, dt, DAMPING);
+            }
+        }
 
         // --- Drawing ---
         clear_background(BLACK);
 
-        draw_text("Phonon Garden - Initial Setup", 20.0, 20.0, 30.0, WHITE);
-        draw_text(
-            "Next step: Implement graph generation and simulation logic.",
-            20.0,
-            50.0,
-            20.0,
-            LIGHTGRAY,
-        );
+        // Draw nodes
+        for node in &graph.nodes {
+            draw_circle(node.pos.x, node.pos.y, 1.5, WHITE);
+        }
 
-        // TODO: Loop through all nodes and draw them using their state color.
-        // for i in 0..graph.nodes.len() {
-        //     let node = &graph.nodes[i];
-        //     let color = get_color_for_node(state.u[i], state.v[i]);
-        //     draw_circle(node.pos.x, node.pos.y, 1.0, color);
-        // }
+        // Draw phase-specific text
+        match phase {
+            AppPhase::Relaxing => {
+                let progress = (relaxation_step as f32 / RELAXATION_ITERATIONS as f32) * 100.0;
+                let text = format!("Relaxing: {:.0}%", progress);
+                draw_text(&text, 20.0, 20.0, 30.0, WHITE);
+            }
+            AppPhase::Simulating => {
+                draw_text("Simulating", 20.0, 20.0, 30.0, WHITE);
+            }
+        }
 
         next_frame().await
     }
