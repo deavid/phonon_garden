@@ -61,7 +61,7 @@ fn create_random_geometric_graph(
         kdtree.add(*point, i).unwrap();
     }
 
-    // 3. Find neighbors for each node and ensure symmetry
+    // 3. Find potential neighbors and connect with distance-dependent probability
     let mut adj = vec![vec![]; num_nodes];
     let radius_squared = (radius as f64).powi(2);
 
@@ -70,14 +70,25 @@ fn create_random_geometric_graph(
             .within(&points[i], radius_squared, &squared_euclidean)
             .unwrap();
 
-        for &(_, &neighbor_index) in neighbors.iter() {
+        for &(distance_sq, &neighbor_index) in neighbors.iter() {
             if i != neighbor_index {
-                // Add edge from i to neighbor_index
-                if !adj[i].contains(&neighbor_index) {
+                // Calculate distance-dependent connection probability
+                let distance = (distance_sq as f32).sqrt();
+                let normalized_distance = distance / radius; // 0.0 to 1.0
+
+                // Probability function: higher chance for closer nodes
+                // Using exponential decay: p = e^(-k * normalized_distance)
+                // where k controls how quickly probability drops with distance
+                let decay_factor = 3.0; // Higher values = steeper falloff
+                let connection_probability = (-decay_factor * normalized_distance).exp();
+
+                // Only add connection if we haven't already processed this pair
+                // and the random chance succeeds
+                let should_connect = rng.random::<f32>() < connection_probability;
+
+                if should_connect && i < neighbor_index {
+                    // Add bidirectional edges (only process each pair once)
                     adj[i].push(neighbor_index);
-                }
-                // Add edge from neighbor_index to i to ensure symmetry
-                if !adj[neighbor_index].contains(&i) {
                     adj[neighbor_index].push(i);
                 }
             }
@@ -187,26 +198,57 @@ fn relax_graph_step(
     graph.nodes += &forces;
 }
 
-/// Runs one time-step of the wave simulation.
-fn run_simulation_step(graph: &Graph, state: &mut SimState, c: f32, dt: f32, damping: f32) {
-    let mut acceleration = Array1::<f32>::zeros(graph.nodes.nrows());
+/// Runs one time-step of the wave simulation with biharmonic stiffness term.
+fn run_simulation_step(
+    graph: &Graph,
+    state: &mut SimState,
+    c: f32,
+    dt: f32,
+    damping: f32,
+    beta: f32,
+) {
+    let mut laplacian = Array1::<f32>::zeros(graph.nodes.nrows());
+    let mut biharmonic = Array1::<f32>::zeros(graph.nodes.nrows());
 
-    // First pass: calculate accelerations
+    // First pass: calculate Laplacian (∇²u)
     for i in 0..graph.nodes.nrows() {
         let u_i = state.u[i];
-        let mut laplacian = 0.0;
+        let mut lap = 0.0;
         for &neighbor_index in &graph.adj[i] {
-            laplacian += state.u[neighbor_index] - u_i;
+            lap += state.u[neighbor_index] - u_i;
         }
-        acceleration[i] = c * c * laplacian;
+        // Normalize by degree for consistency
+        if !graph.adj[i].is_empty() {
+            lap /= graph.adj[i].len() as f32;
+        }
+        laplacian[i] = lap;
     }
 
-    // Second pass: update velocities and displacements
+    // Second pass: calculate biharmonic (∇⁴u = ∇²(∇²u))
     for i in 0..graph.nodes.nrows() {
-        state.v[i] += acceleration[i] * dt;
-        state.v[i] *= 1.0 - damping; // Apply damping
+        let lap_i = laplacian[i];
+        let mut bilap = 0.0;
+        for &neighbor_index in &graph.adj[i] {
+            bilap += laplacian[neighbor_index] - lap_i;
+        }
+        // Normalize by degree for consistency
+        if !graph.adj[i].is_empty() {
+            bilap /= graph.adj[i].len() as f32;
+        }
+        biharmonic[i] = bilap;
+    }
+
+    // Calculate acceleration: tension + bending stiffness
+    let alpha = c * c; // tension coefficient (old c²)
+
+    for i in 0..graph.nodes.nrows() {
+        let acceleration = alpha * laplacian[i] - beta * biharmonic[i];
+        let damping = damping * (state.v[i].powi(2) + state.u[i].powi(2) + 0.00001).sqrt();
+        // Update velocity and displacement
+        state.v[i] += acceleration * dt;
+        state.v[i] *= 1.0 - damping / 300.0;
         state.u[i] += state.v[i] * dt;
-        state.u[i] *= 1.0 - damping / 3.0; // Apply damping for general values
+        state.u[i] *= 1.0 - damping;
     }
 }
 
@@ -214,9 +256,10 @@ use macroquad::texture::{Image, Texture2D};
 
 /// Maps the simulation state (u, v) to a color for rendering.
 fn get_color_for_node(u: f32, v: f32) -> Color {
-    const S: f32 = 3.0;
-    let u = (u * S).cbrt() * S;
-    let v = (v * S).cbrt() * S;
+    const S: f32 = 5.0;
+    const K: f32 = 5.0;
+    let u = (u * S * K).cbrt() * 1.0;
+    let v = (v * S).cbrt() * 0.5;
     let r = (0.5 + u).clamp(0.0, 1.0);
     let g = (0.5 + v).clamp(0.0, 1.0);
     let b = (0.5 - u).clamp(0.0, 1.0);
@@ -244,13 +287,17 @@ async fn main() {
     println!("Welcome to the Phonon Garden. Initializing...");
 
     // --- Configuration ---
-    const NUM_NODES: usize = 100_000;
-    const CONNECTION_RADIUS: f32 = 6.0;
-    const WAVE_SPEED: f32 = 1.0;
-    const DAMPING: f32 = 0.005;
-    const RELAXATION_ITERATIONS: usize = 10;
-    const REPULSION_STRENGTH: f32 = 0.4;
+    const NUM_NODES: usize = 50_000;
+    const CONNECTION_RADIUS: f32 = 20.0;
+    const WAVE_SPEED: f32 = 0.5;
+    const SUB_ITERATIONS: usize = 3;
+    const SPEEDUP: f32 = 5.0;
+    const DAMPING: f32 = 0.2;
+    const MAX_FRAME_TIME: f32 = 1.0 / 30.0;
+    const RELAXATION_ITERATIONS: usize = 1;
+    const REPULSION_STRENGTH: f32 = 0.0001;
     const IDEAL_SPRING_LENGTH_MULTIPLIER: f32 = 1.0;
+    const BETA: f32 = 4.5; // bending stiffness coefficient (new parameter)
 
     // --- Setup Phase ---
     let (width, height) = (screen_width(), screen_height());
@@ -268,16 +315,58 @@ async fn main() {
     let mut image = Image::gen_image_color(width as u16, height as u16, BLACK);
     let texture = Texture2D::from_image(&image);
 
+    // Energy monitoring - will display on screen continuously
+
     // --- Main Loop ---
     loop {
         // --- Input Handling ---
         if is_mouse_button_pressed(MouseButton::Left) {
             let (mx, my) = mouse_position();
             let mouse_pos_f64 = [mx as f64, my as f64];
+
+            // Find the nearest node to start the graph-based plucking
             if let Ok(neighbors) = kdtree.nearest(&mouse_pos_f64, 1, &squared_euclidean) {
-                if let Some(&(_, &nearest_node_index)) = neighbors.first() {
-                    state.u[nearest_node_index] = 1.0;
-                    println!("Plucked node {}", nearest_node_index);
+                if let Some(&(_, &start_node)) = neighbors.first() {
+                    // Graph-based Gaussian pluck parameters
+                    let max_hops = 5; // Maximum number of graph hops to consider
+                    let pluck_strength = 1.0; // Maximum displacement at center
+                    let sigma = 0.3; // Standard deviation in terms of graph hops
+                    let sigma_sq = sigma * sigma;
+
+                    // Use BFS to find nodes within max_hops and their distances
+                    use std::collections::{HashMap, VecDeque};
+                    let mut queue = VecDeque::new();
+                    let mut distances = HashMap::new();
+                    let mut plucked_count = 0;
+
+                    // Initialize BFS
+                    queue.push_back((start_node, 0));
+                    distances.insert(start_node, 0);
+
+                    while let Some((current_node, hop_distance)) = queue.pop_front() {
+                        // Apply Gaussian displacement based on hop distance
+                        let gaussian_weight =
+                            (-(hop_distance as f32).powi(2) / (2.0 * sigma_sq)).exp();
+                        let displacement = pluck_strength * gaussian_weight;
+                        state.u[current_node] += displacement;
+                        plucked_count += 1;
+
+                        // Add neighbors to queue if within max_hops
+                        if hop_distance < max_hops {
+                            for &neighbor_index in &graph.adj[current_node] {
+                                use std::collections::hash_map::Entry;
+                                if let Entry::Vacant(e) = distances.entry(neighbor_index) {
+                                    e.insert(hop_distance + 1);
+                                    queue.push_back((neighbor_index, hop_distance + 1));
+                                }
+                            }
+                        }
+                    }
+
+                    println!(
+                        "Plucked {} nodes with graph-based Gaussian distribution (max hops: {})",
+                        plucked_count, max_hops
+                    );
                 }
             }
         }
@@ -301,9 +390,11 @@ async fn main() {
                 }
             }
             AppPhase::Simulating => {
-                let dt = get_frame_time();
-                // Run wave simulation
-                run_simulation_step(&graph, &mut state, WAVE_SPEED, dt, DAMPING);
+                let dt = get_frame_time().min(MAX_FRAME_TIME) * SPEEDUP / SUB_ITERATIONS as f32;
+                for _ in 0..SUB_ITERATIONS {
+                    // Run wave simulation
+                    run_simulation_step(&graph, &mut state, WAVE_SPEED, dt, DAMPING, BETA);
+                }
             }
         }
 
@@ -339,6 +430,19 @@ async fn main() {
             }
             AppPhase::Simulating => {
                 draw_text("Simulating", 20.0, 20.0, 30.0, WHITE);
+
+                // Calculate and display energy in real-time
+                let kinetic_energy: f32 = state.v.iter().map(|&v| 0.5 * v * v).sum();
+                let potential_energy: f32 = state.u.iter().map(|&u| 0.5 * u * u).sum();
+                let total_energy = kinetic_energy + potential_energy;
+
+                let energy_text = format!("Total Energy: {:.4}", total_energy);
+                let kinetic_text = format!("Kinetic: {:.4}", kinetic_energy);
+                let potential_text = format!("Potential: {:.4}", potential_energy);
+
+                draw_text(&energy_text, 20.0, 50.0, 20.0, WHITE);
+                draw_text(&kinetic_text, 20.0, 75.0, 20.0, WHITE);
+                draw_text(&potential_text, 20.0, 100.0, 20.0, WHITE);
             }
         }
 
