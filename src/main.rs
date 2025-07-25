@@ -47,6 +47,14 @@ const SPRING_CONSTANT: f32 = 0.005;
 /// Influence radius for pixel rendering interpolation
 const PIXEL_INFLUENCE_RADIUS: f32 = 6.0;
 
+/// Whether to use asymmetric connectivity (directed graph)
+/// When true, connections are directional and not guaranteed to be bidirectional
+const USE_ASYMMETRIC_CONNECTIVITY: bool = false;
+
+/// Probability that a reverse connection exists when using asymmetric connectivity
+/// Only applies when USE_ASYMMETRIC_CONNECTIVITY is true
+const REVERSE_CONNECTION_PROBABILITY: f32 = 0.8;
+
 // --- Data Structures ---
 // These will define the components of our simulation space.
 
@@ -153,6 +161,7 @@ fn create_laplacian_matrix(adj: &[Vec<usize>], num_nodes: usize) -> CsMat<f32> {
 
 /// Creates a Random Geometric Graph by connecting nodes within a given radius.
 /// Uses a k-d tree for efficient neighbor search.
+/// Can create either symmetric or asymmetric connectivity based on USE_ASYMMETRIC_CONNECTIVITY flag.
 fn create_random_geometric_graph(
     num_nodes: usize,
     radius: f32,
@@ -191,7 +200,7 @@ fn create_random_geometric_graph(
         step2_duration
     );
 
-    // 3. Find potential neighbors and connect to closest 4
+    // 3. Find potential neighbors and connect them (symmetric or asymmetric)
     let step3_start = Instant::now();
     let mut adj = vec![vec![]; num_nodes];
     let radius_squared = (radius as f64).powi(2);
@@ -201,52 +210,104 @@ fn create_random_geometric_graph(
     let mut potential_connections_total = std::time::Duration::ZERO;
     let mut adj_construction_total = std::time::Duration::ZERO;
 
-    for i in 0..num_nodes {
-        // Time the kdtree query - get more neighbors than we need to account for probabilistic filtering
-        let query_start = Instant::now();
-        let neighbors = kdtree
-            .nearest(
-                &points[i],
-                (MAX_CONNECTIONS * 2 + 1).min(num_nodes),
-                &squared_euclidean,
-            ) // Get extra neighbors for probabilistic selection
-            .unwrap();
-        kdtree_query_total += query_start.elapsed();
+    if USE_ASYMMETRIC_CONNECTIVITY {
+        println!("Creating asymmetric (directed) connectivity...");
 
-        // Time the potential connections construction
-        let connections_start = Instant::now();
-        let mut potential_connections: Vec<(usize, f64)> = neighbors
-            .iter()
-            .filter_map(|&(distance_sq, &neighbor_index)| {
-                // Filter out self and nodes beyond radius
-                if i != neighbor_index && distance_sq <= radius_squared {
-                    // Apply probabilistic selection
-                    if rng.random::<f32>() < NEIGHBOR_KEEP_PROBABILITY {
-                        Some((neighbor_index, distance_sq))
+        for i in 0..num_nodes {
+            // Time the kdtree query
+            let query_start = Instant::now();
+            let neighbors = kdtree
+                .nearest(
+                    &points[i],
+                    (MAX_CONNECTIONS * 2 + 1).min(num_nodes),
+                    &squared_euclidean,
+                )
+                .unwrap();
+            kdtree_query_total += query_start.elapsed();
+
+            // Time the potential connections construction
+            let connections_start = Instant::now();
+            let mut potential_connections: Vec<(usize, f64)> = neighbors
+                .iter()
+                .filter_map(|&(distance_sq, &neighbor_index)| {
+                    if i != neighbor_index && distance_sq <= radius_squared {
+                        if rng.random::<f32>() < NEIGHBOR_KEEP_PROBABILITY {
+                            Some((neighbor_index, distance_sq))
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
-                } else {
-                    None
-                }
-            })
-            .collect();
+                })
+                .collect();
 
-        // No need to sort - nearest() already returns sorted results
-        // Just truncate to ensure we don't exceed MAX_CONNECTIONS
-        potential_connections.truncate(MAX_CONNECTIONS);
-        potential_connections_total += connections_start.elapsed();
+            potential_connections.truncate(MAX_CONNECTIONS);
+            potential_connections_total += connections_start.elapsed();
 
-        // Time the adjacency list construction
-        let adj_start = Instant::now();
-        for (neighbor_index, _) in potential_connections {
-            if i < neighbor_index {
-                // Add bidirectional edges (only process each pair once)
+            // Time the adjacency list construction - ASYMMETRIC VERSION
+            let adj_start = Instant::now();
+            for (neighbor_index, _) in potential_connections {
+                // Add directed edge from i to neighbor_index
                 adj[i].push(neighbor_index);
-                adj[neighbor_index].push(i);
+
+                // Optionally add reverse connection with some probability
+                if rng.random::<f32>() < REVERSE_CONNECTION_PROBABILITY {
+                    adj[neighbor_index].push(i);
+                }
             }
+            adj_construction_total += adj_start.elapsed();
         }
-        adj_construction_total += adj_start.elapsed();
+    } else {
+        println!("Creating symmetric (undirected) connectivity...");
+
+        for i in 0..num_nodes {
+            // Time the kdtree query - get more neighbors than we need to account for probabilistic filtering
+            let query_start = Instant::now();
+            let neighbors = kdtree
+                .nearest(
+                    &points[i],
+                    (MAX_CONNECTIONS * 2 + 1).min(num_nodes),
+                    &squared_euclidean,
+                ) // Get extra neighbors for probabilistic selection
+                .unwrap();
+            kdtree_query_total += query_start.elapsed();
+
+            // Time the potential connections construction
+            let connections_start = Instant::now();
+            let mut potential_connections: Vec<(usize, f64)> = neighbors
+                .iter()
+                .filter_map(|&(distance_sq, &neighbor_index)| {
+                    // Filter out self and nodes beyond radius
+                    if i != neighbor_index && distance_sq <= radius_squared {
+                        // Apply probabilistic selection
+                        if rng.random::<f32>() < NEIGHBOR_KEEP_PROBABILITY {
+                            Some((neighbor_index, distance_sq))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            // No need to sort - nearest() already returns sorted results
+            // Just truncate to ensure we don't exceed MAX_CONNECTIONS
+            potential_connections.truncate(MAX_CONNECTIONS);
+            potential_connections_total += connections_start.elapsed();
+
+            // Time the adjacency list construction - SYMMETRIC VERSION
+            let adj_start = Instant::now();
+            for (neighbor_index, _) in potential_connections {
+                if i < neighbor_index {
+                    // Add bidirectional edges (only process each pair once)
+                    adj[i].push(neighbor_index);
+                    adj[neighbor_index].push(i);
+                }
+            }
+            adj_construction_total += adj_start.elapsed();
+        }
     }
     let step3_duration = step3_start.elapsed();
     println!(
@@ -311,11 +372,33 @@ fn create_random_geometric_graph(
     );
 
     let total_duration = total_start.elapsed();
+
+    // Calculate connectivity statistics
+    let total_edges: usize = adj.iter().map(|n| n.len()).sum();
+    let avg_out_degree = total_edges as f32 / num_nodes as f32;
+
+    // For asymmetric graphs, calculate in-degree statistics
+    let connectivity_info = if USE_ASYMMETRIC_CONNECTIVITY {
+        let mut in_degrees = vec![0; num_nodes];
+        for neighbors in &adj {
+            for &neighbor in neighbors {
+                in_degrees[neighbor] += 1;
+            }
+        }
+        let avg_in_degree = in_degrees.iter().sum::<usize>() as f32 / num_nodes as f32;
+        format!(
+            "asymmetric connectivity - avg out-degree: {:.2}, avg in-degree: {:.2}",
+            avg_out_degree, avg_in_degree
+        )
+    } else {
+        format!("symmetric connectivity - avg degree: {:.2}", avg_out_degree)
+    };
+
     println!(
-        "Graph generation completed in {:.2?}: {} nodes, average degree: {:.2}, boundary damped nodes: {}, matrix nnz: {}",
+        "Graph generation completed in {:.2?}: {} nodes, {}, boundary damped nodes: {}, matrix nnz: {}",
         total_duration,
         num_nodes,
-        adj.iter().map(|n| n.len()).sum::<usize>() as f32 / num_nodes as f32,
+        connectivity_info,
         boundary_damping.iter().filter(|&&d| d > 0.0).count(),
         laplacian_matrix.nnz()
     );
