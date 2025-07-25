@@ -1,47 +1,48 @@
 # Phonon Garden
 
-Phonon Garden is a real-time, interactive physics simulation that explores the emergent properties of wave propagation on a large-scale, discrete 2D space. The project aims to create a visually striking "digital petri dish" where complex wave phenomena like reflection, refraction, and interference arise naturally from a simple set of underlying rules.
+Phonon Garden is a real-time, interactive physics simulation that explores the emergent properties of wave propagation on a discrete 2D space. The project aims to create a visually striking "digital petri dish" where complex wave phenomena like reflection, refraction, and interference arise naturally from a simple set of underlying rules.
 
-## The Core Concept
+![Phonon Garden Screenshot](screenshot1.png)
 
-At its heart, Phonon Garden simulates a 2D "drum head" or "aether" made not of a continuous surface, but of millions of interconnected points (nodes). When this medium is "plucked" by a user's click, a wave disturbance is created. The simulation calculates how this wave evolves over time, spreading through the random network of nodes.
+## Motivation
 
-The primary goal is to build a system where **isotropy** (the property of being uniform in all directions) emerges from a locally **anisotropic** (directionally-biased) and random substrate. In other words, we want to see perfect circular waves expanding from a chaotic mesh of points, demonstrating how a continuous, Euclidean-like space can be approximated by a discrete graph.
+Is a continuous space a requirement for a proper simulation or can it be made it into discrete pieces? moreover, does a space require to have "axis" and a concept of direction? When we have a 2D space we often have a coordinate system (x,y) and with that we can very easily identify a direction, and axes.
+
+However, we can also build a space made by a graph of connected nodes, and if the connections don't have any particular order, we wouldn't have the concept of a direction.
+
+What would happen if we built a space like that, discrete, based on nodes and connections, but also the connections were random - and the space would be 2D in the medium and large scales, but technically more like a crumbled knot in the small scale. Would circular patterns emerge naturally?
+
+This is why I built this small demo, just to show myself if it works or not. And it does - kinda.
+
+## It's all AI vibe coding - mostly
+
+Even this file is also AI generated. Some of these sections (like this one) have been written by me. But most of the code is entirely written by different AI agents. Mainly Jules for the scaffolding, GitHub Copilot with Claude 4 for the fine coding, and Gemini 2.5 Pro from AiStudio for guidance and planning.
+
+It's just a toy idea that I wanted to see what happens in these conditions, and I'm sharing just in case anyone finds it interesting in any way. But it's basically for myself, for my own understanding of how physics works if space is discrete, isotropic, and randomly connected.
 
 ## Technical Implementation
 
-The simulation is built in Rust for high performance, memory safety, and the ability to leverage modern multi-core CPUs.
-
 ### 1. The Space: A Random Geometric Graph (RGG)
 
-The discrete space is modeled as a **Random Geometric Graph**.
-- **Generation:** A large number of nodes (e.g., 10,000 to 1,000,000+) are placed at random positions within a 2D plane.
-- **Connectivity:** Two nodes are connected with an edge if and only if their Euclidean distance is less than a specified connection radius `R`.
-- **Properties:** This method creates a graph with a "natural" structure. The number of connections per node fluctuates based on local density, which is crucial for achieving statistical isotropy and avoiding the artifacts common in regular grid-based simulations.
+The discrete space is modeled as a **Random Geometric Graph**. A large number of nodes are placed randomly, and connections are formed based on proximity and a probability function, creating a non-uniform network that allows for the emergence of isotropic behavior.
 
-### 2. The Physics: A Discretized Wave Equation
+### 2. The Physics: A Fourth-Order Plate Equation
 
-To model wave behavior correctly (as opposed to simple diffusion), the simulation must account for inertia. This is achieved by tracking two state variables for each node:
-- **`u` (Displacement):** The scalar value representing the node's "height" or displacement from its resting state.
-- **`v` (Velocity):** The rate of change of the displacement (`du/dt`).
+To achieve a stable and visually smooth wave, the simulation goes beyond a simple wave equation and implements a more physically robust model akin to a stiff plate. The acceleration of each node is determined by a **triad of forces**:
 
-The simulation evolves in discrete time steps (`Δt`) using a second-order numerical integration scheme. The core of the physics engine is the **Graph Laplacian**, which serves as a discrete analog to the second spatial derivative (`∇²u`).
+1.  **Tension Force (`α * ∇²u`):** The standard **Graph Laplacian** term, which drives the primary wave propagation.
+2.  **Stiffness Force (`-β * ∇⁴u`):** A **Graph Biharmonic** term (the Laplacian of the Laplacian), which strongly penalizes high-frequency "jaggedness." This is the key to suppressing noise and ensuring local smoothness.
+3.  **Global Restoring Force (`-k * u`):** A global "spring" force that pulls every node back towards its equilibrium state (`u=0`), ensuring long-term stability.
 
-- **Force Calculation:** The "restoring force" on a node is proportional to its Laplacian value, which measures how much its displacement deviates from the average of its neighbors. `Acceleration ∝ Laplacian(u)`.
-- **Update Rule:** At each time step, the acceleration is used to update the velocity, and the new velocity is used to update the displacement.
+### 3. Key Features and Optimizations
 
-### 3. Key Features
+-   **High-Performance Sparse Matrix Operations:** The core simulation loop achieves its speed by **pre-computing the Laplacian operator into a sparse matrix (`sprs::CsMat`)**. The physics calculations are then performed using highly optimized sparse matrix-vector multiplications, which is significantly faster than iterating through adjacency lists for a graph of this scale.
 
-- **High-Performance Simulation:** Written in Rust and leveraging the `ndarray` crate for efficient numerical operations and `rayon` for multi-threading the core simulation loop, allowing for a massive number of nodes in real-time.
-- **Interactive "Plucking":** Users can click anywhere on the screen to introduce a new wave into the system, creating a dynamic and engaging experience.
-- **Emergent Isotropy:** The primary visual goal. Despite the random, irregular connections at the micro-level, waves will be observed to propagate in near-perfect circles at the macro-level.
-- **Advanced Visualization:** The state of each node is mapped to a unique color based on *both* its displacement (`u`) and its velocity (`v`). This creates a rich, informative, and visually stunning representation of the wave's phase, showing not just its height but also its direction of travel.
-- **Tunable Parameters:** The simulation will allow for real-time or configuration-based tuning of key physical constants:
-    - **Connection Radius `R`:** To control the density and connectivity of the graph.
-    - **Wave Speed `c`:** To change the propagation speed.
-    - **Damping:** A small, configurable damping factor is included to allow waves to naturally fade over time, creating a more realistic and visually clean experience. It can be set to zero to simulate a perfect, energy-conserving system.
-- **Graph Relaxation (Pre-computation):** An initial "relaxation" step adjusts node positions to create a more uniform, "blue noise" distribution, which improves the visual quality of the simulation.
+-   **Advanced Damping Model:** To maintain stability and visual clarity, two sophisticated damping mechanisms are used:
+    -   **Adaptive Damping:** Damping is applied most strongly in areas of high curvature, effectively targeting and eliminating numerical noise where it appears.
+    -   **Boundary Damping:** A "sponge" layer around the edges of the simulation space absorbs outgoing waves, preventing chaotic reflections and creating the illusion of an infinite medium.
 
-## Project Vision
+-   **Smooth Interpolated Rendering:** Instead of rendering discrete nodes as individual pixels, the visualization uses a pre-computed influence map. Each screen pixel's final color is a **weighted average of the states of nearby nodes**, resulting in a beautifully smooth, continuous, and anti-aliased image that hides the underlying discrete nature of the graph.
 
-Phonon Garden aims to be more than just a technical demo. It is an artistic exploration of the beauty of emergent complexity. By visualizing the fundamental mathematics of waves in a novel way, it seeks to create a mesmerizing and contemplative digital artwork.
+-   **Interactive "Plucking":** Users can click to introduce a disturbance. The initial energy is applied as a smooth Gaussian pulse in *graph space* (using a Breadth-First Search on node connections), respecting the simulation's core principle of operating without Euclidean coordinates for its dynamics.
+

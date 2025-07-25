@@ -1,22 +1,69 @@
 use macroquad::prelude::{
     clear_background, draw_text, get_frame_time, is_mouse_button_pressed, mouse_position,
-    next_frame, screen_height, screen_width, Color, Conf, MouseButton, Vec2, BLACK, WHITE,
+    next_frame, screen_height, screen_width, Color, Conf, MouseButton, BLACK, WHITE,
 };
 use macroquad::texture::draw_texture;
 use ndarray::Array1;
+
+// --- Configuration Constants ---
+// These control the behavior of the phonon garden simulation.
+
+const NUM_NODES_SQRT: usize = 300;
+
+/// Number of nodes in the random geometric graph
+const NUM_NODES: usize = NUM_NODES_SQRT * NUM_NODES_SQRT;
+
+/// Maximum connection radius for graph edges (pixels)
+const CONNECTION_RADIUS: f32 = 4000.0 / (NUM_NODES_SQRT as f32);
+
+/// Maximum number of connections per node
+const MAX_CONNECTIONS: usize = 30;
+
+/// Probability of keeping each potential neighbor (0.0 to 1.0)
+const NEIGHBOR_KEEP_PROBABILITY: f32 = 0.15;
+
+/// Wave propagation speed coefficient
+const WAVE_SPEED: f32 = 0.02;
+
+/// Number of simulation sub-iterations per frame for temporal stability
+const SUB_ITERATIONS: usize = 3;
+
+/// Time acceleration factor for the simulation
+const SPEEDUP: f32 = 20.0;
+
+/// Base damping coefficient for wave attenuation
+const DAMPING: f32 = 0.9;
+
+/// Maximum frame time to prevent large simulation steps
+const MAX_FRAME_TIME: f32 = 1.0 / 30.0;
+
+/// Biharmonic stiffness coefficient for bending resistance
+const BETA: f32 = 0.2;
+
+/// Spring constant for restoring force that pulls displacement back to zero
+/// Higher values create stronger restoring force, making waves return to equilibrium faster
+const SPRING_CONSTANT: f32 = 0.005;
+
+/// Influence radius for pixel rendering interpolation
+const PIXEL_INFLUENCE_RADIUS: f32 = 6.0;
 
 // --- Data Structures ---
 // These will define the components of our simulation space.
 
 use ndarray::Array2;
+use sprs::CsMat;
 
 // Represents the entire discrete space: a collection of nodes and their connections.
 struct Graph {
     // Using Array2 for efficient row-based access to node positions.
     // Each row is a `[x, y]` coordinate.
-    nodes: Array2<f32>,
+    _nodes: Array2<f32>,
     // Adjacency list: for each node, a list of indices of its neighbors.
     adj: Vec<Vec<usize>>,
+    // Boundary damping coefficient for each node (0.0 = no damping, 1.0 = full damping)
+    boundary_damping: Array1<f32>,
+    // Pre-computed normalized Laplacian matrix for efficient computation
+    laplacian_matrix: CsMat<f32>,
 }
 
 // Holds the dynamic state of the wave simulation.
@@ -27,12 +74,82 @@ struct SimState {
     v: Array1<f32>,
 }
 
+// Stores pre-computed pixel influence data for smooth rendering
+struct PixelInfluences {
+    // For each pixel, stores (node_index, weight) pairs for nodes that influence it
+    influences: Vec<Vec<(usize, f32)>>,
+    width: u32,
+    height: u32,
+}
+
+// Timing metrics for simulation steps
+#[derive(Debug, Clone)]
+struct SimulationMetrics {
+    laplacian_time: f32,  // Time for Laplacian calculation (ms)
+    biharmonic_time: f32, // Time for biharmonic calculation (ms)
+    update_time: f32,     // Time for state updates (ms)
+    total_time: f32,      // Total simulation step time (ms)
+    frame_count: u64,     // Frame counter for temporal LOD
+}
+
+impl SimulationMetrics {
+    fn new() -> Self {
+        Self {
+            laplacian_time: 0.0,
+            biharmonic_time: 0.0,
+            update_time: 0.0,
+            total_time: 0.0,
+            frame_count: 0,
+        }
+    }
+
+    // Apply IIR filter for smoothing: new_value = alpha * current + (1-alpha) * new
+    fn smooth_update(&mut self, new_metrics: &SimulationMetrics, alpha: f32) {
+        self.laplacian_time =
+            alpha * self.laplacian_time + (1.0 - alpha) * new_metrics.laplacian_time;
+        self.biharmonic_time =
+            alpha * self.biharmonic_time + (1.0 - alpha) * new_metrics.biharmonic_time;
+        self.update_time = alpha * self.update_time + (1.0 - alpha) * new_metrics.update_time;
+        self.total_time = alpha * self.total_time + (1.0 - alpha) * new_metrics.total_time;
+        self.frame_count = new_metrics.frame_count; // Don't smooth frame count
+    }
+}
+
 // --- Core Functions ---
 // These are the placeholders for the main logic that the agent will implement.
 
 use kdtree::distance::squared_euclidean;
 use kdtree::KdTree;
 use rand::Rng;
+use sprs::TriMat;
+use std::time::Instant;
+
+/// Creates a normalized Laplacian matrix from the adjacency list
+fn create_laplacian_matrix(adj: &[Vec<usize>], num_nodes: usize) -> CsMat<f32> {
+    let mut triplets = TriMat::new((num_nodes, num_nodes));
+
+    for (i, neighbors) in adj.iter().enumerate().take(num_nodes) {
+        let degree = neighbors.len() as f32;
+
+        if degree > 0.0 {
+            // For discrete Laplacian: L[i] = (1/degree) * sum(u[neighbors] - u[i])
+            // This translates to: L[i] = (1/degree) * sum(u[neighbors]) - u[i]
+            // In matrix form: L[i] = (1/degree) * sum over neighbors + (-1) * u[i]
+
+            // Diagonal entry: -1 (coefficient of u[i])
+            triplets.add_triplet(i, i, -1.0);
+
+            // Off-diagonal entries: 1/degree for each neighbor
+            let weight = 1.0 / degree;
+            for &neighbor in neighbors {
+                triplets.add_triplet(i, neighbor, weight);
+            }
+        }
+        // If degree is 0, the row remains all zeros (isolated node)
+    }
+
+    triplets.to_csr()
+}
 
 /// Creates a Random Geometric Graph by connecting nodes within a given radius.
 /// Uses a k-d tree for efficient neighbor search.
@@ -42,9 +159,11 @@ fn create_random_geometric_graph(
     width: f32,
     height: f32,
 ) -> (Graph, KdTree<f64, usize, [f64; 2]>) {
+    let total_start = Instant::now();
     let mut rng = rand::rngs::ThreadRng::default();
 
     // 1. Create nodes with random positions
+    let step1_start = Instant::now();
     let mut nodes = Array2::<f32>::zeros((num_nodes, 2));
     let mut points = Vec::with_capacity(num_nodes);
     for i in 0..num_nodes {
@@ -54,151 +173,223 @@ fn create_random_geometric_graph(
         nodes[[i, 1]] = y;
         points.push([x as f64, y as f64]);
     }
+    let step1_duration = step1_start.elapsed();
+    println!(
+        "Step 1 (node generation) completed in {:.2?}",
+        step1_duration
+    );
 
     // 2. Build the k-d tree for efficient spatial queries
+    let step2_start = Instant::now();
     let mut kdtree = KdTree::new(2);
     for (i, point) in points.iter().enumerate() {
         kdtree.add(*point, i).unwrap();
     }
+    let step2_duration = step2_start.elapsed();
+    println!(
+        "Step 2 (k-d tree construction) completed in {:.2?}",
+        step2_duration
+    );
 
-    // 3. Find potential neighbors and connect with distance-dependent probability
+    // 3. Find potential neighbors and connect to closest 4
+    let step3_start = Instant::now();
     let mut adj = vec![vec![]; num_nodes];
     let radius_squared = (radius as f64).powi(2);
 
+    // Step 3 sub-timings
+    let mut kdtree_query_total = std::time::Duration::ZERO;
+    let mut potential_connections_total = std::time::Duration::ZERO;
+    let mut adj_construction_total = std::time::Duration::ZERO;
+
     for i in 0..num_nodes {
+        // Time the kdtree query - get more neighbors than we need to account for probabilistic filtering
+        let query_start = Instant::now();
         let neighbors = kdtree
-            .within(&points[i], radius_squared, &squared_euclidean)
+            .nearest(
+                &points[i],
+                (MAX_CONNECTIONS * 2 + 1).min(num_nodes),
+                &squared_euclidean,
+            ) // Get extra neighbors for probabilistic selection
             .unwrap();
+        kdtree_query_total += query_start.elapsed();
 
-        for &(distance_sq, &neighbor_index) in neighbors.iter() {
-            if i != neighbor_index {
-                // Calculate distance-dependent connection probability
-                let distance = (distance_sq as f32).sqrt();
-                let normalized_distance = distance / radius; // 0.0 to 1.0
-
-                // Probability function: higher chance for closer nodes
-                // Using exponential decay: p = e^(-k * normalized_distance)
-                // where k controls how quickly probability drops with distance
-                let decay_factor = 3.0; // Higher values = steeper falloff
-                let connection_probability = (-decay_factor * normalized_distance).exp();
-
-                // Only add connection if we haven't already processed this pair
-                // and the random chance succeeds
-                let should_connect = rng.random::<f32>() < connection_probability;
-
-                if should_connect && i < neighbor_index {
-                    // Add bidirectional edges (only process each pair once)
-                    adj[i].push(neighbor_index);
-                    adj[neighbor_index].push(i);
+        // Time the potential connections construction
+        let connections_start = Instant::now();
+        let mut potential_connections: Vec<(usize, f64)> = neighbors
+            .iter()
+            .filter_map(|&(distance_sq, &neighbor_index)| {
+                // Filter out self and nodes beyond radius
+                if i != neighbor_index && distance_sq <= radius_squared {
+                    // Apply probabilistic selection
+                    if rng.random::<f32>() < NEIGHBOR_KEEP_PROBABILITY {
+                        Some((neighbor_index, distance_sq))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
                 }
+            })
+            .collect();
+
+        // No need to sort - nearest() already returns sorted results
+        // Just truncate to ensure we don't exceed MAX_CONNECTIONS
+        potential_connections.truncate(MAX_CONNECTIONS);
+        potential_connections_total += connections_start.elapsed();
+
+        // Time the adjacency list construction
+        let adj_start = Instant::now();
+        for (neighbor_index, _) in potential_connections {
+            if i < neighbor_index {
+                // Add bidirectional edges (only process each pair once)
+                adj[i].push(neighbor_index);
+                adj[neighbor_index].push(i);
             }
         }
+        adj_construction_total += adj_start.elapsed();
     }
-
+    let step3_duration = step3_start.elapsed();
     println!(
-        "Graph generated: {} nodes, average degree: {:.2}",
-        num_nodes,
-        adj.iter().map(|n| n.len()).sum::<usize>() as f32 / num_nodes as f32
+        "Step 3 (neighbor finding & graph construction) completed in {:.2?}",
+        step3_duration
+    );
+    println!(
+        "  - kdtree queries: {:.2?} ({:.1}%)",
+        kdtree_query_total,
+        kdtree_query_total.as_secs_f64() / step3_duration.as_secs_f64() * 100.0
+    );
+    println!(
+        "  - potential connections: {:.2?} ({:.1}%)",
+        potential_connections_total,
+        potential_connections_total.as_secs_f64() / step3_duration.as_secs_f64() * 100.0
+    );
+    println!(
+        "  - adjacency construction: {:.2?} ({:.1}%)",
+        adj_construction_total,
+        adj_construction_total.as_secs_f64() / step3_duration.as_secs_f64() * 100.0
     );
 
-    (Graph { nodes, adj }, kdtree)
+    // 4. Calculate boundary damping coefficients
+    let step4_start = Instant::now();
+    let mut boundary_damping = Array1::<f32>::zeros(num_nodes);
+    let boundary_zone_percentage = 0.05; // 5% from the border
+    let boundary_zone_width = width.min(height) * boundary_zone_percentage;
+
+    for i in 0..num_nodes {
+        let x = nodes[[i, 0]];
+        let y = nodes[[i, 1]];
+
+        // Calculate distance to nearest boundary
+        let dist_to_boundary = f32::min(
+            f32::min(x, width - x),  // distance to left/right edges
+            f32::min(y, height - y), // distance to top/bottom edges
+        );
+
+        // If within boundary zone, calculate damping coefficient
+        if dist_to_boundary < boundary_zone_width {
+            // Smooth transition from 0 at boundary_zone_width to 1 at boundary
+            let normalized_distance = dist_to_boundary / boundary_zone_width;
+            // Use cubic function for smooth transition: (1 - t)³
+            let damping_factor = (1.0 - normalized_distance).powi(3);
+            boundary_damping[i] = damping_factor;
+        }
+        // else remains 0.0 (no boundary damping)
+    }
+    let step4_duration = step4_start.elapsed();
+    println!(
+        "Step 4 (boundary damping calculation) completed in {:.2?}",
+        step4_duration
+    );
+
+    // 5. Create the normalized Laplacian matrix
+    let step5_start = Instant::now();
+    let laplacian_matrix = create_laplacian_matrix(&adj, num_nodes);
+    let step5_duration = step5_start.elapsed();
+    println!(
+        "Step 5 (Laplacian matrix creation) completed in {:.2?}",
+        step5_duration
+    );
+
+    let total_duration = total_start.elapsed();
+    println!(
+        "Graph generation completed in {:.2?}: {} nodes, average degree: {:.2}, boundary damped nodes: {}, matrix nnz: {}",
+        total_duration,
+        num_nodes,
+        adj.iter().map(|n| n.len()).sum::<usize>() as f32 / num_nodes as f32,
+        boundary_damping.iter().filter(|&&d| d > 0.0).count(),
+        laplacian_matrix.nnz()
+    );
+
+    (
+        Graph {
+            _nodes: nodes,
+            adj,
+            boundary_damping,
+            laplacian_matrix,
+        },
+        kdtree,
+    )
 }
 
-/// Performs a single step of graph relaxation.
-fn relax_graph_step(
-    graph: &mut Graph,
+/// Pre-computes pixel influence data for smooth interpolated rendering
+fn create_pixel_influences(
     kdtree: &KdTree<f64, usize, [f64; 2]>,
-    repulsion_strength: f32,
-    spring_strength: f32,
-    ideal_distance: f32,
-    width: f32,
-    height: f32,
-) {
-    let mut forces = Array2::<f32>::zeros((graph.nodes.nrows(), 2));
-    let containment_strength = 0.001;
+    width: u32,
+    height: u32,
+    influence_radius: f32,
+) -> PixelInfluences {
+    let mut influences = Vec::with_capacity((width * height) as usize);
+    let epsilon_sq = 0.2;
+    let radius_sq = (influence_radius as f64).powi(2);
 
-    // Calculate current average edge length for uniform target
-    let mut total_edge_length = 0.0;
-    let mut edge_count = 0;
+    println!("Pre-computing pixel influences...");
 
-    for i in 0..graph.nodes.nrows() {
-        let pos_i = Vec2::new(graph.nodes[[i, 0]], graph.nodes[[i, 1]]);
-        for &neighbor_index in &graph.adj[i] {
-            if neighbor_index > i {
-                // Only count each edge once
-                let pos_neighbor = Vec2::new(
-                    graph.nodes[[neighbor_index, 0]],
-                    graph.nodes[[neighbor_index, 1]],
-                );
-                let dist = (pos_neighbor - pos_i).length();
-                total_edge_length += dist;
-                edge_count += 1;
+    for y in 0..height {
+        for x in 0..width {
+            let pixel_pos = [x as f64, y as f64];
+            let mut pixel_influences = Vec::new();
+
+            // Find all nodes within influence radius of this pixel
+            if let Ok(neighbors) = kdtree.within(&pixel_pos, radius_sq, &squared_euclidean) {
+                for &(distance_sq, &node_index) in neighbors.iter() {
+                    // Calculate weight using squared inverse distance with epsilon
+                    let weight = 1.0 / (distance_sq as f32 + epsilon_sq);
+                    pixel_influences.push((node_index, weight));
+                }
+
+                // Keep only the top 4 strongest influences
+                if pixel_influences.len() > 4 {
+                    // Sort by weight (descending) and keep only top 4
+                    pixel_influences.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                    pixel_influences.truncate(4);
+                }
             }
+
+            influences.push(pixel_influences);
+        }
+
+        // Progress indicator
+        if y % 200 == 100 {
+            println!("  Progress: {}/{} rows", y, height);
         }
     }
 
-    let target_edge_length = if edge_count > 0 {
-        total_edge_length / edge_count as f32
-    } else {
-        ideal_distance // Fallback to the provided ideal distance
-    };
+    let total_influences: usize = influences.iter().map(|p| p.len()).sum();
+    println!(
+        "Pixel influences computed: {} pixels, average {} influences per pixel",
+        influences.len(),
+        total_influences as f32 / influences.len() as f32
+    );
 
-    for i in 0..graph.nodes.nrows() {
-        // Repulsion from nearby nodes
-        let pos_i = Vec2::new(graph.nodes[[i, 0]], graph.nodes[[i, 1]]);
-        let pos_f64 = [pos_i.x as f64, pos_i.y as f64];
-        let neighbors = kdtree
-            .within(&pos_f64, ideal_distance.powi(2) as f64, &squared_euclidean)
-            .unwrap();
-
-        for &(_, &j) in neighbors.iter() {
-            if i == j {
-                continue;
-            }
-            let pos_j = Vec2::new(graph.nodes[[j, 0]], graph.nodes[[j, 1]]);
-            let d = pos_i - pos_j;
-            let dist_sq = d.length_squared();
-            if dist_sq > 1e-6 {
-                let force = d / dist_sq;
-                forces[[i, 0]] += force.x * repulsion_strength;
-                forces[[i, 1]] += force.y * repulsion_strength;
-            }
-        }
-
-        // Spring force with connected neighbors - now using uniform target length
-        for &neighbor_index in &graph.adj[i] {
-            let pos_neighbor = Vec2::new(
-                graph.nodes[[neighbor_index, 0]],
-                graph.nodes[[neighbor_index, 1]],
-            );
-            let d = pos_neighbor - pos_i;
-            let dist = d.length();
-            let displacement = dist - target_edge_length;
-            let force = d.normalize_or_zero() * displacement * spring_strength;
-            forces[[i, 0]] += force.x;
-            forces[[i, 1]] += force.y;
-        }
-
-        // Containment force from window boundaries
-        let margin = 50.0;
-        if pos_i.x < margin {
-            forces[[i, 0]] += (margin - pos_i.x) * containment_strength;
-        }
-        if pos_i.x > width - margin {
-            forces[[i, 0]] -= (pos_i.x - (width - margin)) * containment_strength;
-        }
-        if pos_i.y < margin {
-            forces[[i, 1]] += (margin - pos_i.y) * containment_strength;
-        }
-        if pos_i.y > height - margin {
-            forces[[i, 1]] -= (pos_i.y - (height - margin)) * containment_strength;
-        }
+    PixelInfluences {
+        influences,
+        width,
+        height,
     }
-
-    graph.nodes += &forces;
 }
 
 /// Runs one time-step of the wave simulation with biharmonic stiffness term.
+/// Uses parallel operations and optimized memory access patterns.
 fn run_simulation_step(
     graph: &Graph,
     state: &mut SimState,
@@ -206,69 +397,137 @@ fn run_simulation_step(
     dt: f32,
     damping: f32,
     beta: f32,
-) {
-    let mut laplacian = Array1::<f32>::zeros(graph.nodes.nrows());
-    let mut biharmonic = Array1::<f32>::zeros(graph.nodes.nrows());
+    frame_count: u64,
+) -> SimulationMetrics {
+    let step_start = Instant::now();
 
-    // First pass: calculate Laplacian (∇²u)
-    for i in 0..graph.nodes.nrows() {
-        let u_i = state.u[i];
-        let mut lap = 0.0;
-        for &neighbor_index in &graph.adj[i] {
-            lap += state.u[neighbor_index] - u_i;
-        }
-        // Normalize by degree for consistency
-        if !graph.adj[i].is_empty() {
-            lap /= graph.adj[i].len() as f32;
-        }
-        laplacian[i] = lap;
-    }
+    // First pass: calculate Laplacian (∇²u) using sparse matrix multiplication
+    let laplacian_start = Instant::now();
+    let laplacian = &graph.laplacian_matrix * &state.u;
+    let laplacian_time = laplacian_start.elapsed().as_secs_f32() * 1000.0;
 
-    // Second pass: calculate biharmonic (∇⁴u = ∇²(∇²u))
-    for i in 0..graph.nodes.nrows() {
-        let lap_i = laplacian[i];
-        let mut bilap = 0.0;
-        for &neighbor_index in &graph.adj[i] {
-            bilap += laplacian[neighbor_index] - lap_i;
-        }
-        // Normalize by degree for consistency
-        if !graph.adj[i].is_empty() {
-            bilap /= graph.adj[i].len() as f32;
-        }
-        biharmonic[i] = bilap;
-    }
+    // Second pass: calculate biharmonic (∇⁴u) = Laplacian of Laplacian
+    let biharmonic_start = Instant::now();
+    let biharmonic = &graph.laplacian_matrix * &laplacian;
+    let biharmonic_time = biharmonic_start.elapsed().as_secs_f32() * 1000.0;
 
-    // Calculate acceleration: tension + bending stiffness
-    let alpha = c * c; // tension coefficient (old c²)
+    // Update velocities and positions
+    let update_start = Instant::now();
+    let alpha = c * c;
 
-    for i in 0..graph.nodes.nrows() {
-        let acceleration = alpha * laplacian[i] - beta * biharmonic[i];
-        let damping = damping * (state.v[i].powi(2) + state.u[i].powi(2) + 0.00001).sqrt();
-        // Update velocity and displacement
-        state.v[i] += acceleration * dt;
-        state.v[i] *= 1.0 - damping / 300.0;
-        state.u[i] += state.v[i] * dt;
-        state.u[i] *= 1.0 - damping;
+    // Calculate acceleration: a = α∇²u - β∇⁴u - k*u (spring restoring force)
+    let spring_force = &state.u * (-SPRING_CONSTANT);
+    let acceleration = &laplacian * alpha - &biharmonic * beta + spring_force;
+
+    // Update velocity: v(t+dt) = v(t) + a*dt
+    let velocity_update = &acceleration * dt;
+    state.v += &velocity_update;
+
+    // Apply adaptive damping based on biharmonic magnitude
+    // Higher curvature (biharmonic) leads to more damping
+    let adaptive_damping = biharmonic.mapv(|b| {
+        let biharmonic_magnitude = b.abs();
+        damping * biharmonic_magnitude
+    });
+
+    // Apply the adaptive damping
+    state
+        .v
+        .iter_mut()
+        .zip(adaptive_damping.iter())
+        .for_each(|(v, &adaptive_damp)| {
+            *v *= 1.0 - adaptive_damp.min(0.4);
+        });
+
+    // Apply boundary damping
+    state
+        .v
+        .iter_mut()
+        .zip(graph.boundary_damping.iter())
+        .for_each(|(v, &boundary)| {
+            if boundary > 0.0 {
+                *v *= 1.0 - boundary * 0.5;
+            }
+        });
+
+    // Update position: u(t+dt) = u(t) + v*dt
+    let displacement_update = &state.v * dt;
+    state.u += &displacement_update;
+
+    let update_time = update_start.elapsed().as_secs_f32() * 1000.0;
+    let total_time = step_start.elapsed().as_secs_f32() * 1000.0;
+
+    SimulationMetrics {
+        laplacian_time,
+        biharmonic_time,
+        update_time,
+        total_time,
+        frame_count,
     }
 }
-
 use macroquad::texture::{Image, Texture2D};
 
 /// Maps the simulation state (u, v) to a color for rendering.
 fn get_color_for_node(u: f32, v: f32) -> Color {
-    const S: f32 = 5.0;
-    const K: f32 = 5.0;
-    let u = (u * S * K).cbrt() * 1.0;
-    let v = (v * S).cbrt() * 0.5;
-    let r = (0.5 + u).clamp(0.0, 1.0);
-    let g = (0.5 + v).clamp(0.0, 1.0);
-    let b = (0.5 - u).clamp(0.0, 1.0);
+    const S: f32 = 50.0;
+
+    // Treat (u, v) as a vector and calculate its magnitude
+    let magnitude = (u * u + v * v).sqrt();
+    let intensity = ((magnitude * S).sqrt() / 2.0).clamp(0.0, 0.5);
+
+    // Use the vector components for color direction, magnitude for intensity
+    let u_normalized = if magnitude > 1e-6 { u / magnitude } else { 0.0 };
+    let v_normalized = if magnitude > 1e-6 { v / magnitude } else { 0.0 };
+
+    let r = (0.5 + u_normalized * intensity).clamp(0.0, 1.0);
+    let g = (0.5 + v_normalized * intensity).clamp(0.0, 1.0);
+    let b = (0.5 - u_normalized * intensity).clamp(0.0, 1.0);
+
     Color::new(r, g, b, 1.0)
 }
 
-enum AppPhase {
-    Relaxing,
-    Simulating,
+/// Renders the simulation using smooth pixel interpolation
+fn render_with_pixel_influences(
+    image: &mut Image,
+    pixel_influences: &PixelInfluences,
+    state: &SimState,
+) {
+    // Clear the image buffer
+    image.bytes.chunks_exact_mut(4).for_each(|pixel| {
+        pixel[0] = 0;
+        pixel[1] = 0;
+        pixel[2] = 0;
+        pixel[3] = 255;
+    });
+
+    // Render each pixel using weighted interpolation
+    for y in 0..pixel_influences.height {
+        for x in 0..pixel_influences.width {
+            let pixel_index = (y * pixel_influences.width + x) as usize;
+            let influences = &pixel_influences.influences[pixel_index];
+
+            if !influences.is_empty() {
+                let mut total_weight = 0.0;
+                let mut weighted_u = 0.0;
+                let mut weighted_v = 0.0;
+
+                // Calculate weighted average of nearby nodes
+                for &(node_index, weight) in influences {
+                    total_weight += weight;
+                    weighted_u += weight * state.u[node_index];
+                    weighted_v += weight * state.v[node_index];
+                }
+
+                // Normalize and get color
+                if total_weight > 0.0 {
+                    let final_u = weighted_u / total_weight;
+                    let final_v = weighted_v / total_weight;
+                    let color = get_color_for_node(final_u, final_v);
+                    image.set_pixel(x, y, color);
+                }
+            }
+        }
+    }
 }
 
 // --- Main Application Loop ---
@@ -286,26 +545,14 @@ fn window_conf() -> Conf {
 async fn main() {
     println!("Welcome to the Phonon Garden. Initializing...");
 
-    // --- Configuration ---
-    const NUM_NODES: usize = 50_000;
-    const CONNECTION_RADIUS: f32 = 20.0;
-    const WAVE_SPEED: f32 = 0.5;
-    const SUB_ITERATIONS: usize = 3;
-    const SPEEDUP: f32 = 5.0;
-    const DAMPING: f32 = 0.2;
-    const MAX_FRAME_TIME: f32 = 1.0 / 30.0;
-    const RELAXATION_ITERATIONS: usize = 1;
-    const REPULSION_STRENGTH: f32 = 0.0001;
-    const IDEAL_SPRING_LENGTH_MULTIPLIER: f32 = 1.0;
-    const BETA: f32 = 4.5; // bending stiffness coefficient (new parameter)
-
     // --- Setup Phase ---
     let (width, height) = (screen_width(), screen_height());
-    let (mut graph, kdtree) =
+    let (graph, kdtree) =
         create_random_geometric_graph(NUM_NODES, CONNECTION_RADIUS, width, height);
 
-    let mut phase = AppPhase::Relaxing;
-    let mut relaxation_step = 0;
+    // Pre-compute pixel influences for smooth rendering
+    let pixel_influences =
+        create_pixel_influences(&kdtree, width as u32, height as u32, PIXEL_INFLUENCE_RADIUS);
 
     let mut state = SimState {
         u: Array1::zeros(NUM_NODES),
@@ -315,7 +562,16 @@ async fn main() {
     let mut image = Image::gen_image_color(width as u16, height as u16, BLACK);
     let texture = Texture2D::from_image(&image);
 
-    // Energy monitoring - will display on screen continuously
+    // Initialize smoothed simulation metrics
+    let mut smoothed_metrics = SimulationMetrics::new();
+    let smoothing_factor = 0.2; // IIR filter coefficient (higher = more smoothing)
+
+    // Timing reporting
+    let mut last_report_time = Instant::now();
+    let report_interval = std::time::Duration::from_secs(5);
+
+    // Frame counter for temporal level-of-detail
+    let mut frame_count = 0u64;
 
     // --- Main Loop ---
     loop {
@@ -328,9 +584,9 @@ async fn main() {
             if let Ok(neighbors) = kdtree.nearest(&mouse_pos_f64, 1, &squared_euclidean) {
                 if let Some(&(_, &start_node)) = neighbors.first() {
                     // Graph-based Gaussian pluck parameters
-                    let max_hops = 5; // Maximum number of graph hops to consider
+                    let max_hops = 8; // Maximum number of graph hops to consider
                     let pluck_strength = 1.0; // Maximum displacement at center
-                    let sigma = 0.3; // Standard deviation in terms of graph hops
+                    let sigma = 0.6; // Standard deviation in terms of graph hops
                     let sigma_sq = sigma * sigma;
 
                     // Use BFS to find nodes within max_hops and their distances
@@ -372,79 +628,76 @@ async fn main() {
         }
 
         // --- Phase-specific Logic ---
-        match phase {
-            AppPhase::Relaxing => {
-                if relaxation_step < RELAXATION_ITERATIONS {
-                    relax_graph_step(
-                        &mut graph,
-                        &kdtree,
-                        REPULSION_STRENGTH,
-                        0.01, // spring_strength
-                        CONNECTION_RADIUS * IDEAL_SPRING_LENGTH_MULTIPLIER,
-                        width,
-                        height,
-                    );
-                    relaxation_step += 1;
-                } else {
-                    phase = AppPhase::Simulating;
-                }
-            }
-            AppPhase::Simulating => {
-                let dt = get_frame_time().min(MAX_FRAME_TIME) * SPEEDUP / SUB_ITERATIONS as f32;
-                for _ in 0..SUB_ITERATIONS {
-                    // Run wave simulation
-                    run_simulation_step(&graph, &mut state, WAVE_SPEED, dt, DAMPING, BETA);
-                }
-            }
+        let dt = get_frame_time().min(MAX_FRAME_TIME) * SPEEDUP / SUB_ITERATIONS as f32;
+        let mut frame_metrics = SimulationMetrics::new();
+        for _ in 0..SUB_ITERATIONS {
+            // Run wave simulation and collect metrics
+            let step_metrics = run_simulation_step(
+                &graph,
+                &mut state,
+                WAVE_SPEED,
+                dt,
+                DAMPING,
+                BETA,
+                frame_count,
+            );
+            // Accumulate metrics over sub-iterations
+            frame_metrics.laplacian_time += step_metrics.laplacian_time / SUB_ITERATIONS as f32;
+            frame_metrics.biharmonic_time += step_metrics.biharmonic_time / SUB_ITERATIONS as f32;
+            frame_metrics.update_time += step_metrics.update_time / SUB_ITERATIONS as f32;
+            frame_metrics.total_time += step_metrics.total_time / SUB_ITERATIONS as f32;
+            frame_count += 1;
+        }
+        frame_metrics.frame_count = frame_count;
+
+        // Apply smoothing to the accumulated frame metrics
+        smoothed_metrics.smooth_update(&frame_metrics, smoothing_factor);
+
+        // Report timing metrics to console every 5 seconds
+        if last_report_time.elapsed() >= report_interval {
+            println!(
+                "Performance Report - Laplacian: {:.2}ms, Biharmonic: {:.2}ms, Updates: {:.2}ms, Total: {:.2}ms",
+                smoothed_metrics.laplacian_time,
+                smoothed_metrics.biharmonic_time,
+                smoothed_metrics.update_time,
+                smoothed_metrics.total_time
+            );
+            last_report_time = Instant::now();
         }
 
         // --- Drawing ---
-        // Clear the image buffer
-        image.bytes.chunks_exact_mut(4).for_each(|pixel| {
-            pixel[0] = 0;
-            pixel[1] = 0;
-            pixel[2] = 0;
-            pixel[3] = 255;
-        });
-
-        // Draw nodes to the image buffer
-        for i in 0..graph.nodes.nrows() {
-            let x = graph.nodes[[i, 0]] as u32;
-            let y = graph.nodes[[i, 1]] as u32;
-            if x < width as u32 && y < height as u32 {
-                let color = get_color_for_node(state.u[i], state.v[i]);
-                image.set_pixel(x, y, color);
-            }
-        }
+        render_with_pixel_influences(&mut image, &pixel_influences, &state);
         texture.update(&image);
 
         clear_background(BLACK);
         draw_texture(&texture, 0.0, 0.0, WHITE);
 
         // Draw phase-specific text
-        match phase {
-            AppPhase::Relaxing => {
-                let progress = (relaxation_step as f32 / RELAXATION_ITERATIONS as f32) * 100.0;
-                let text = format!("Relaxing: {:.0}%", progress);
-                draw_text(&text, 20.0, 20.0, 30.0, WHITE);
-            }
-            AppPhase::Simulating => {
-                draw_text("Simulating", 20.0, 20.0, 30.0, WHITE);
+        draw_text("Simulating", 20.0, 20.0, 30.0, WHITE);
 
-                // Calculate and display energy in real-time
-                let kinetic_energy: f32 = state.v.iter().map(|&v| 0.5 * v * v).sum();
-                let potential_energy: f32 = state.u.iter().map(|&u| 0.5 * u * u).sum();
-                let total_energy = kinetic_energy + potential_energy;
+        // Calculate and display energy in real-time
+        let kinetic_energy: f32 = state.v.iter().map(|&v| 0.5 * v * v).sum();
+        let potential_energy: f32 = state.u.iter().map(|&u| 0.5 * u * u).sum();
+        let total_energy = kinetic_energy + potential_energy;
 
-                let energy_text = format!("Total Energy: {:.4}", total_energy);
-                let kinetic_text = format!("Kinetic: {:.4}", kinetic_energy);
-                let potential_text = format!("Potential: {:.4}", potential_energy);
+        let energy_text = format!("Total Energy: {:.4}", total_energy);
+        let kinetic_text = format!("Kinetic: {:.4}", kinetic_energy);
+        let potential_text = format!("Potential: {:.4}", potential_energy);
 
-                draw_text(&energy_text, 20.0, 50.0, 20.0, WHITE);
-                draw_text(&kinetic_text, 20.0, 75.0, 20.0, WHITE);
-                draw_text(&potential_text, 20.0, 100.0, 20.0, WHITE);
-            }
-        }
+        draw_text(&energy_text, 20.0, 50.0, 20.0, WHITE);
+        draw_text(&kinetic_text, 20.0, 75.0, 20.0, WHITE);
+        draw_text(&potential_text, 20.0, 100.0, 20.0, WHITE);
+
+        // Display simulation timing metrics
+        let timing_text = format!("Sim Total: {:.2}ms", smoothed_metrics.total_time);
+        let laplacian_text = format!("Laplacian: {:.2}ms", smoothed_metrics.laplacian_time);
+        let biharmonic_text = format!("Biharmonic: {:.2}ms", smoothed_metrics.biharmonic_time);
+        let update_text = format!("Updates: {:.2}ms", smoothed_metrics.update_time);
+
+        draw_text(&timing_text, 20.0, 140.0, 20.0, WHITE);
+        draw_text(&laplacian_text, 20.0, 165.0, 20.0, WHITE);
+        draw_text(&biharmonic_text, 20.0, 190.0, 20.0, WHITE);
+        draw_text(&update_text, 20.0, 215.0, 20.0, WHITE);
 
         next_frame().await
     }
