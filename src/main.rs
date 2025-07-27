@@ -1,6 +1,7 @@
 use macroquad::prelude::{
-    clear_background, draw_text, get_frame_time, is_key_pressed, is_mouse_button_pressed, mouse_position,
-    next_frame, screen_height, screen_width, Color, Conf, KeyCode, MouseButton, BLACK, WHITE,
+    clear_background, draw_text, get_frame_time, is_key_pressed, is_mouse_button_pressed,
+    mouse_position, next_frame, screen_height, screen_width, Color, Conf, KeyCode, MouseButton,
+    BLACK, WHITE,
 };
 use macroquad::texture::draw_texture;
 use ndarray::Array1;
@@ -8,7 +9,7 @@ use ndarray::Array1;
 // --- Configuration Constants ---
 // These control the behavior of the phonon garden simulation.
 
-const NUM_NODES_SQRT: usize = 300;
+const NUM_NODES_SQRT: usize = 600;
 
 /// Number of nodes in the random geometric graph
 const NUM_NODES: usize = NUM_NODES_SQRT * NUM_NODES_SQRT;
@@ -17,13 +18,13 @@ const NUM_NODES: usize = NUM_NODES_SQRT * NUM_NODES_SQRT;
 const CONNECTION_RADIUS: f32 = 4000.0 / (NUM_NODES_SQRT as f32);
 
 /// Maximum number of connections per node
-const MAX_CONNECTIONS: usize = 30;
+const MAX_CONNECTIONS: usize = 60;
 
 /// Probability of keeping each potential neighbor (0.0 to 1.0)
 const NEIGHBOR_KEEP_PROBABILITY: f32 = 0.15;
 
 /// Wave propagation speed coefficient
-const WAVE_SPEED: f32 = 0.02;
+const WAVE_SPEED: f32 = 0.2;
 
 /// Number of simulation sub-iterations per frame for temporal stability
 const SUB_ITERATIONS: usize = 3;
@@ -32,7 +33,7 @@ const SUB_ITERATIONS: usize = 3;
 const SPEEDUP: f32 = 20.0;
 
 /// Base damping coefficient for wave attenuation
-const DAMPING: f32 = 0.9;
+const DAMPING: f32 = 0.0;
 
 /// Maximum frame time to prevent large simulation steps
 const MAX_FRAME_TIME: f32 = 1.0 / 30.0;
@@ -764,7 +765,13 @@ async fn main() {
 
         // Draw phase-specific text
         draw_text("Simulating", 20.0, 20.0, 30.0, WHITE);
-        draw_text("Click to pluck • Press R to reset", 20.0, height - 30.0, 20.0, WHITE);
+        draw_text(
+            "Click to pluck • Press R to reset",
+            20.0,
+            height - 30.0,
+            20.0,
+            WHITE,
+        );
 
         // Calculate and display energy in real-time
         let kinetic_energy: f32 = state.v.iter().map(|&v| 0.5 * v * v).sum();
