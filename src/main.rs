@@ -91,6 +91,107 @@ struct PixelInfluences {
     height: u32,
 }
 
+// Handles viewport scaling and aspect ratio management
+struct Viewport {
+    // Original pixel influences dimensions
+    original_width: u32,
+    original_height: u32,
+    // Current screen dimensions
+    screen_width: u32,
+    screen_height: u32,
+    // Viewport area within screen (for aspect ratio preservation)
+    viewport_x: u32,
+    viewport_y: u32,
+    viewport_width: u32,
+    viewport_height: u32,
+    // Scale factors for mapping between original and viewport
+    scale_x: f32,
+    scale_y: f32,
+}
+
+impl Viewport {
+    fn new(original_width: u32, original_height: u32) -> Self {
+        Self {
+            original_width,
+            original_height,
+            screen_width: original_width,
+            screen_height: original_height,
+            viewport_x: 0,
+            viewport_y: 0,
+            viewport_width: original_width,
+            viewport_height: original_height,
+            scale_x: 1.0,
+            scale_y: 1.0,
+        }
+    }
+
+    fn update_screen_size(&mut self, new_width: u32, new_height: u32) {
+        self.screen_width = new_width;
+        self.screen_height = new_height;
+
+        // Calculate aspect ratios
+        let original_aspect = self.original_width as f32 / self.original_height as f32;
+        let screen_aspect = new_width as f32 / new_height as f32;
+
+        if screen_aspect > original_aspect {
+            // Screen is wider than original - pillarbox (black bars on sides)
+            self.viewport_height = new_height;
+            self.viewport_width = (new_height as f32 * original_aspect) as u32;
+            self.viewport_x = (new_width - self.viewport_width) / 2;
+            self.viewport_y = 0;
+        } else {
+            // Screen is taller than original - letterbox (black bars top/bottom)
+            self.viewport_width = new_width;
+            self.viewport_height = (new_width as f32 / original_aspect) as u32;
+            self.viewport_x = 0;
+            self.viewport_y = (new_height - self.viewport_height) / 2;
+        }
+
+        self.scale_x = self.viewport_width as f32 / self.original_width as f32;
+        self.scale_y = self.viewport_height as f32 / self.original_height as f32;
+    }
+
+    // Convert screen coordinates to original pixel influence coordinates
+    fn screen_to_original(&self, screen_x: u32, screen_y: u32) -> Option<(u32, u32)> {
+        if screen_x < self.viewport_x
+            || screen_x >= self.viewport_x + self.viewport_width
+            || screen_y < self.viewport_y
+            || screen_y >= self.viewport_y + self.viewport_height
+        {
+            return None; // Outside viewport
+        }
+
+        let viewport_x = screen_x - self.viewport_x;
+        let viewport_y = screen_y - self.viewport_y;
+
+        let original_x = (viewport_x as f32 / self.scale_x) as u32;
+        let original_y = (viewport_y as f32 / self.scale_y) as u32;
+
+        if original_x < self.original_width && original_y < self.original_height {
+            Some((original_x, original_y))
+        } else {
+            None
+        }
+    }
+
+    // Convert mouse position to simulation coordinates
+    fn screen_mouse_to_sim(
+        &self,
+        mouse_x: f32,
+        mouse_y: f32,
+        sim_width: f32,
+        sim_height: f32,
+    ) -> Option<(f32, f32)> {
+        if let Some((orig_x, orig_y)) = self.screen_to_original(mouse_x as u32, mouse_y as u32) {
+            let sim_x = (orig_x as f32 / self.original_width as f32) * sim_width;
+            let sim_y = (orig_y as f32 / self.original_height as f32) * sim_height;
+            Some((sim_x, sim_y))
+        } else {
+            None
+        }
+    }
+}
+
 // Timing metrics for simulation steps
 #[derive(Debug, Clone)]
 struct SimulationMetrics {
@@ -614,6 +715,61 @@ fn render_with_pixel_influences(
     }
 }
 
+/// Renders the simulation with viewport scaling and aspect ratio preservation
+fn render_with_viewport_scaling(
+    image: &mut Image,
+    pixel_influences: &PixelInfluences,
+    viewport: &Viewport,
+    state: &SimState,
+) {
+    // Clear the entire image buffer to black
+    image.bytes.chunks_exact_mut(4).for_each(|pixel| {
+        pixel[0] = 0;
+        pixel[1] = 0;
+        pixel[2] = 0;
+        pixel[3] = 255;
+    });
+
+    // Only render within the viewport area
+    for screen_y in viewport.viewport_y..(viewport.viewport_y + viewport.viewport_height) {
+        for screen_x in viewport.viewport_x..(viewport.viewport_x + viewport.viewport_width) {
+            // Map screen coordinates to original pixel influence coordinates
+            if let Some((orig_x, orig_y)) = viewport.screen_to_original(screen_x, screen_y) {
+                let pixel_index = (orig_y * pixel_influences.width + orig_x) as usize;
+                if pixel_index < pixel_influences.influences.len() {
+                    let influences = &pixel_influences.influences[pixel_index];
+
+                    if !influences.is_empty() {
+                        let mut total_weight = 0.0;
+                        let mut weighted_u = 0.0;
+                        let mut weighted_v = 0.0;
+
+                        // Calculate weighted average of nearby nodes
+                        for &(node_index, weight) in influences {
+                            total_weight += weight;
+                            weighted_u += weight * state.u[node_index];
+                            weighted_v += weight * state.v[node_index];
+                        }
+
+                        // Normalize and get color
+                        if total_weight > 0.0 {
+                            let final_u = weighted_u / total_weight;
+                            let final_v = weighted_v / total_weight;
+                            let color = get_color_for_node(final_u, final_v);
+
+                            // Make sure we're within image bounds
+                            if screen_x < viewport.screen_width && screen_y < viewport.screen_height
+                            {
+                                image.set_pixel(screen_x, screen_y, color);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // --- Main Application Loop ---
 
 fn window_conf() -> Conf {
@@ -630,21 +786,28 @@ async fn main() {
     println!("Welcome to the Phonon Garden. Initializing...");
 
     // --- Setup Phase ---
-    let (width, height) = (screen_width(), screen_height());
+    let (sim_width, sim_height) = (screen_width(), screen_height());
     let (graph, kdtree) =
-        create_random_geometric_graph(NUM_NODES, CONNECTION_RADIUS, width, height);
+        create_random_geometric_graph(NUM_NODES, CONNECTION_RADIUS, sim_width, sim_height);
 
     // Pre-compute pixel influences for smooth rendering
-    let pixel_influences =
-        create_pixel_influences(&kdtree, width as u32, height as u32, PIXEL_INFLUENCE_RADIUS);
+    let pixel_influences = create_pixel_influences(
+        &kdtree,
+        sim_width as u32,
+        sim_height as u32,
+        PIXEL_INFLUENCE_RADIUS,
+    );
+
+    // Initialize viewport for scaling and aspect ratio management
+    let mut viewport = Viewport::new(sim_width as u32, sim_height as u32);
 
     let mut state = SimState {
         u: Array1::zeros(NUM_NODES),
         v: Array1::zeros(NUM_NODES),
     };
 
-    let mut image = Image::gen_image_color(width as u16, height as u16, BLACK);
-    let texture = Texture2D::from_image(&image);
+    let mut image = Image::gen_image_color(sim_width as u16, sim_height as u16, BLACK);
+    let mut texture = Texture2D::from_image(&image);
 
     // Initialize smoothed simulation metrics
     let mut smoothed_metrics = SimulationMetrics::new();
@@ -659,54 +822,76 @@ async fn main() {
 
     // --- Main Loop ---
     loop {
+        // Check for window resize and update viewport
+        let current_width = screen_width() as u32;
+        let current_height = screen_height() as u32;
+
+        if current_width != viewport.screen_width || current_height != viewport.screen_height {
+            println!(
+                "Window resized to {}x{}, updating viewport with aspect ratio preservation...",
+                current_width, current_height
+            );
+            viewport.update_screen_size(current_width, current_height);
+
+            // Recreate image and texture for new size
+            image = Image::gen_image_color(current_width as u16, current_height as u16, BLACK);
+            texture = Texture2D::from_image(&image);
+        }
+
         // --- Input Handling ---
         if is_mouse_button_pressed(MouseButton::Left) {
             let (mx, my) = mouse_position();
-            let mouse_pos_f64 = [mx as f64, my as f64];
 
-            // Find the nearest node to start the graph-based plucking
-            if let Ok(neighbors) = kdtree.nearest(&mouse_pos_f64, 1, &squared_euclidean) {
-                if let Some(&(_, &start_node)) = neighbors.first() {
-                    // Graph-based Gaussian pluck parameters
-                    let max_hops = 8; // Maximum number of graph hops to consider
-                    let pluck_strength = 1.0; // Maximum displacement at center
-                    let sigma = 0.6; // Standard deviation in terms of graph hops
-                    let sigma_sq = sigma * sigma;
+            // Transform mouse coordinates to simulation space using viewport
+            if let Some((sim_mx, sim_my)) =
+                viewport.screen_mouse_to_sim(mx, my, sim_width, sim_height)
+            {
+                let mouse_pos_f64 = [sim_mx as f64, sim_my as f64];
 
-                    // Use BFS to find nodes within max_hops and their distances
-                    use std::collections::{HashMap, VecDeque};
-                    let mut queue = VecDeque::new();
-                    let mut distances = HashMap::new();
-                    let mut plucked_count = 0;
+                // Find the nearest node to start the graph-based plucking
+                if let Ok(neighbors) = kdtree.nearest(&mouse_pos_f64, 1, &squared_euclidean) {
+                    if let Some(&(_, &start_node)) = neighbors.first() {
+                        // Graph-based Gaussian pluck parameters
+                        let max_hops = 8; // Maximum number of graph hops to consider
+                        let pluck_strength = 1.0; // Maximum displacement at center
+                        let sigma = 0.6; // Standard deviation in terms of graph hops
+                        let sigma_sq = sigma * sigma;
 
-                    // Initialize BFS
-                    queue.push_back((start_node, 0));
-                    distances.insert(start_node, 0);
+                        // Use BFS to find nodes within max_hops and their distances
+                        use std::collections::{HashMap, VecDeque};
+                        let mut queue = VecDeque::new();
+                        let mut distances = HashMap::new();
+                        let mut plucked_count = 0;
 
-                    while let Some((current_node, hop_distance)) = queue.pop_front() {
-                        // Apply Gaussian displacement based on hop distance
-                        let gaussian_weight =
-                            (-(hop_distance as f32).powi(2) / (2.0 * sigma_sq)).exp();
-                        let displacement = pluck_strength * gaussian_weight;
-                        state.u[current_node] += displacement;
-                        plucked_count += 1;
+                        // Initialize BFS
+                        queue.push_back((start_node, 0));
+                        distances.insert(start_node, 0);
 
-                        // Add neighbors to queue if within max_hops
-                        if hop_distance < max_hops {
-                            for &neighbor_index in &graph.adj[current_node] {
-                                use std::collections::hash_map::Entry;
-                                if let Entry::Vacant(e) = distances.entry(neighbor_index) {
-                                    e.insert(hop_distance + 1);
-                                    queue.push_back((neighbor_index, hop_distance + 1));
+                        while let Some((current_node, hop_distance)) = queue.pop_front() {
+                            // Apply Gaussian displacement based on hop distance
+                            let gaussian_weight =
+                                (-(hop_distance as f32).powi(2) / (2.0 * sigma_sq)).exp();
+                            let displacement = pluck_strength * gaussian_weight;
+                            state.u[current_node] += displacement;
+                            plucked_count += 1;
+
+                            // Add neighbors to queue if within max_hops
+                            if hop_distance < max_hops {
+                                for &neighbor_index in &graph.adj[current_node] {
+                                    use std::collections::hash_map::Entry;
+                                    if let Entry::Vacant(e) = distances.entry(neighbor_index) {
+                                        e.insert(hop_distance + 1);
+                                        queue.push_back((neighbor_index, hop_distance + 1));
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    println!(
+                        println!(
                         "Plucked {} nodes with graph-based Gaussian distribution (max hops: {})",
                         plucked_count, max_hops
                     );
+                    }
                 }
             }
         }
@@ -757,7 +942,14 @@ async fn main() {
         }
 
         // --- Drawing ---
-        render_with_pixel_influences(&mut image, &pixel_influences, &state);
+        // Use viewport-scaled rendering if window size changed, otherwise use original
+        if viewport.screen_width != viewport.original_width
+            || viewport.screen_height != viewport.original_height
+        {
+            render_with_viewport_scaling(&mut image, &pixel_influences, &viewport, &state);
+        } else {
+            render_with_pixel_influences(&mut image, &pixel_influences, &state);
+        }
         texture.update(&image);
 
         clear_background(BLACK);
@@ -768,7 +960,7 @@ async fn main() {
         draw_text(
             "Click to pluck • Press R to reset",
             20.0,
-            height - 30.0,
+            viewport.screen_height as f32 - 30.0,
             20.0,
             WHITE,
         );
