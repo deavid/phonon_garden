@@ -9,7 +9,7 @@ use ndarray::Array1;
 // --- Configuration Constants ---
 // These control the behavior of the phonon garden simulation.
 
-const NUM_NODES_SQRT: usize = 600;
+const NUM_NODES_SQRT: usize = 300;
 
 /// Number of nodes in the random geometric graph
 const NUM_NODES: usize = NUM_NODES_SQRT * NUM_NODES_SQRT;
@@ -18,28 +18,28 @@ const NUM_NODES: usize = NUM_NODES_SQRT * NUM_NODES_SQRT;
 const CONNECTION_RADIUS: f32 = 4000.0 / (NUM_NODES_SQRT as f32);
 
 /// Maximum number of connections per node
-const MAX_CONNECTIONS: usize = 60;
+const MAX_CONNECTIONS: usize = 20;
 
 /// Probability of keeping each potential neighbor (0.0 to 1.0)
 const NEIGHBOR_KEEP_PROBABILITY: f32 = 0.15;
 
 /// Wave propagation speed coefficient
-const WAVE_SPEED: f32 = 0.2;
+const WAVE_SPEED: f32 = 0.9;
 
 /// Number of simulation sub-iterations per frame for temporal stability
-const SUB_ITERATIONS: usize = 3;
+const SUB_ITERATIONS: usize = 10;
 
 /// Time acceleration factor for the simulation
-const SPEEDUP: f32 = 20.0;
+const SPEEDUP: f32 = 10.0;
 
 /// Base damping coefficient for wave attenuation
-const DAMPING: f32 = 0.9;
+const DAMPING: f32 = 0.5;
 
 /// Maximum frame time to prevent large simulation steps
 const MAX_FRAME_TIME: f32 = 1.0 / 30.0;
 
 /// Biharmonic stiffness coefficient for bending resistance
-const BETA: f32 = 0.2;
+const BETA: f32 = 2.2;
 
 /// Spring constant for restoring force that pulls displacement back to zero
 /// Higher values create stronger restoring force, making waves return to equilibrium faster
@@ -49,7 +49,7 @@ const SPRING_CONSTANT: f32 = 0.005;
 const PIXEL_INFLUENCE_RADIUS: f32 = 6.0;
 
 /// Boundary zone percentage for calculating boundary damping (as fraction from border)
-const BOUNDARY_ZONE_PERCENTAGE: f32 = 0.05;
+const BOUNDARY_ZONE_PERCENTAGE: f32 = 0.00;
 
 /// Whether to use asymmetric connectivity (directed graph)
 /// When true, connections are directional and not guaranteed to be bidirectional
