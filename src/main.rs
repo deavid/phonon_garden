@@ -1,7 +1,7 @@
 use macroquad::prelude::{
-    clear_background, draw_text, get_frame_time, is_key_pressed, is_mouse_button_pressed,
-    mouse_position, next_frame, screen_height, screen_width, Color, Conf, KeyCode, MouseButton,
-    BLACK, WHITE,
+    clear_background, draw_text, get_frame_time, is_key_down, is_key_pressed,
+    is_mouse_button_pressed, mouse_position, next_frame, screen_height, screen_width, Color, Conf,
+    KeyCode, MouseButton, BLACK, WHITE,
 };
 use macroquad::texture::draw_texture;
 use ndarray::Array1;
@@ -841,7 +841,11 @@ async fn main() {
         }
 
         // --- Input Handling ---
-        if is_mouse_button_pressed(MouseButton::Left) {
+        let left_clicked = is_mouse_button_pressed(MouseButton::Left);
+        let right_clicked = is_mouse_button_pressed(MouseButton::Right);
+        let shift_pressed = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
+
+        if left_clicked || right_clicked {
             let (mx, my) = mouse_position();
 
             // Transform mouse coordinates to simulation space using viewport
@@ -855,44 +859,62 @@ async fn main() {
                     if let Some(&(_, &start_node)) = neighbors.first() {
                         // Graph-based Gaussian pluck parameters
                         let max_hops = 8; // Maximum number of graph hops to consider
-                        let pluck_strength = 1.0; // Maximum displacement at center
+                        let base_strength = 1.0; // Base strength value
                         let sigma = 0.6; // Standard deviation in terms of graph hops
                         let sigma_sq = sigma * sigma;
 
-                        // Use BFS to find nodes within max_hops and their distances
-                        use std::collections::{HashMap, VecDeque};
-                        let mut queue = VecDeque::new();
-                        let mut distances = HashMap::new();
-                        let mut plucked_count = 0;
+                        // Determine pluck strength and target based on mouse button and shift state
+                        let (pluck_strength, pluck_velocity, target_name) =
+                            match (left_clicked, right_clicked, shift_pressed) {
+                                (true, false, false) => (base_strength, false, "displacement +1"), // Left click: u = +1
+                                (false, true, false) => (-base_strength, false, "displacement -1"), // Right click: u = -1
+                                (true, false, true) => (base_strength, true, "velocity +1"), // Shift + Left click: v = +1
+                                (false, true, true) => (-base_strength, true, "velocity -1"), // Shift + Right click: v = -1
+                                _ => (0.0, false, "none"), // Should not happen
+                            };
 
-                        // Initialize BFS
-                        queue.push_back((start_node, 0));
-                        distances.insert(start_node, 0);
+                        if pluck_strength != 0.0 {
+                            // Use BFS to find nodes within max_hops and their distances
+                            use std::collections::{HashMap, VecDeque};
+                            let mut queue = VecDeque::new();
+                            let mut distances = HashMap::new();
+                            let mut plucked_count = 0;
 
-                        while let Some((current_node, hop_distance)) = queue.pop_front() {
-                            // Apply Gaussian displacement based on hop distance
-                            let gaussian_weight =
-                                (-(hop_distance as f32).powi(2) / (2.0 * sigma_sq)).exp();
-                            let displacement = pluck_strength * gaussian_weight;
-                            state.u[current_node] += displacement;
-                            plucked_count += 1;
+                            // Initialize BFS
+                            queue.push_back((start_node, 0));
+                            distances.insert(start_node, 0);
 
-                            // Add neighbors to queue if within max_hops
-                            if hop_distance < max_hops {
-                                for &neighbor_index in &graph.adj[current_node] {
-                                    use std::collections::hash_map::Entry;
-                                    if let Entry::Vacant(e) = distances.entry(neighbor_index) {
-                                        e.insert(hop_distance + 1);
-                                        queue.push_back((neighbor_index, hop_distance + 1));
+                            while let Some((current_node, hop_distance)) = queue.pop_front() {
+                                // Apply Gaussian distribution based on hop distance
+                                let gaussian_weight =
+                                    (-(hop_distance as f32).powi(2) / (2.0 * sigma_sq)).exp();
+                                let value = pluck_strength * gaussian_weight;
+
+                                // Apply to either displacement (u) or velocity (v)
+                                if pluck_velocity {
+                                    state.v[current_node] += value;
+                                } else {
+                                    state.u[current_node] += value;
+                                }
+                                plucked_count += 1;
+
+                                // Add neighbors to queue if within max_hops
+                                if hop_distance < max_hops {
+                                    for &neighbor_index in &graph.adj[current_node] {
+                                        use std::collections::hash_map::Entry;
+                                        if let Entry::Vacant(e) = distances.entry(neighbor_index) {
+                                            e.insert(hop_distance + 1);
+                                            queue.push_back((neighbor_index, hop_distance + 1));
+                                        }
                                     }
                                 }
                             }
-                        }
 
-                        println!(
-                        "Plucked {} nodes with graph-based Gaussian distribution (max hops: {})",
-                        plucked_count, max_hops
-                    );
+                            println!(
+                                "Plucked {} nodes with {} (max hops: {})",
+                                plucked_count, target_name, max_hops
+                            );
+                        }
                     }
                 }
             }
@@ -960,7 +982,7 @@ async fn main() {
         // Draw phase-specific text
         draw_text("Simulating", 20.0, 20.0, 30.0, WHITE);
         draw_text(
-            "Click to pluck • Press R to reset",
+            "Click: u+1 • Right-click: u-1 • Shift+Click: v+1 • Shift+Right-click: v-1 • R: reset",
             20.0,
             viewport.screen_height as f32 - 30.0,
             20.0,
