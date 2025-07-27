@@ -33,7 +33,7 @@ const SUB_ITERATIONS: usize = 3;
 const SPEEDUP: f32 = 20.0;
 
 /// Base damping coefficient for wave attenuation
-const DAMPING: f32 = 0.0;
+const DAMPING: f32 = 0.9;
 
 /// Maximum frame time to prevent large simulation steps
 const MAX_FRAME_TIME: f32 = 1.0 / 30.0;
@@ -47,6 +47,9 @@ const SPRING_CONSTANT: f32 = 0.005;
 
 /// Influence radius for pixel rendering interpolation
 const PIXEL_INFLUENCE_RADIUS: f32 = 6.0;
+
+/// Boundary zone percentage for calculating boundary damping (as fraction from border)
+const BOUNDARY_ZONE_PERCENTAGE: f32 = 0.05;
 
 /// Whether to use asymmetric connectivity (directed graph)
 /// When true, connections are directional and not guaranteed to be bidirectional
@@ -435,8 +438,7 @@ fn create_random_geometric_graph(
     // 4. Calculate boundary damping coefficients
     let step4_start = Instant::now();
     let mut boundary_damping = Array1::<f32>::zeros(num_nodes);
-    let boundary_zone_percentage = 0.05; // 5% from the border
-    let boundary_zone_width = width.min(height) * boundary_zone_percentage;
+    let boundary_zone_width = width.min(height) * BOUNDARY_ZONE_PERCENTAGE;
 
     for i in 0..num_nodes {
         let x = nodes[[i, 0]];
