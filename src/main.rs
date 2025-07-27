@@ -1,6 +1,6 @@
 use macroquad::prelude::{
-    clear_background, draw_text, get_frame_time, is_mouse_button_pressed, mouse_position,
-    next_frame, screen_height, screen_width, Color, Conf, MouseButton, BLACK, WHITE,
+    clear_background, draw_text, get_frame_time, is_key_pressed, is_mouse_button_pressed, mouse_position,
+    next_frame, screen_height, screen_width, Color, Conf, KeyCode, MouseButton, BLACK, WHITE,
 };
 use macroquad::texture::draw_texture;
 use ndarray::Array1;
@@ -710,6 +710,13 @@ async fn main() {
             }
         }
 
+        // Reset simulation when 'R' key is pressed
+        if is_key_pressed(KeyCode::R) {
+            state.u.fill(0.0);
+            state.v.fill(0.0);
+            println!("Simulation reset!");
+        }
+
         // --- Phase-specific Logic ---
         let dt = get_frame_time().min(MAX_FRAME_TIME) * SPEEDUP / SUB_ITERATIONS as f32;
         let mut frame_metrics = SimulationMetrics::new();
@@ -757,6 +764,7 @@ async fn main() {
 
         // Draw phase-specific text
         draw_text("Simulating", 20.0, 20.0, 30.0, WHITE);
+        draw_text("Click to pluck • Press R to reset", 20.0, height - 30.0, 20.0, WHITE);
 
         // Calculate and display energy in real-time
         let kinetic_energy: f32 = state.v.iter().map(|&v| 0.5 * v * v).sum();
